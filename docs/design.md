@@ -12,9 +12,10 @@ Claude（Anthropic サブスクリプション）と Codex（ChatGPT サブス�
 > 代わりに、Codex は公式に提供される `codex app-server` の JSON-RPC を、
 > Claude は公式 CLI が管理するクレデンシャルを使う方式に変更した（§7）。
 >
-> **v3.1**: Claude も公開拡張点（**statusLine**）で残量を取得できることが判明したため、
-> こちらを既定にした（§6.3）。**既定構成では非公開 API への依存がゼロになり、
-> 本アプリからの外向き通信も無くなった。** `/api/oauth/usage` は opt-in の副次手段に降格。
+> **v3.2**: 取得は**両プロバイダとも pull でなければならない**という制約を明示した。
+> 一時は Claude の既定を statusLine（push）にしていたが、仕込んでいない環境の消費が
+> 拾えず残量の絶対値がずれるため取り下げた（§20）。Claude は
+> `/api/oauth/usage` を既定、`claude` の `/usage` を PTY で読む経路を代替とする（§6.3）。
 >
 > v2 での変更: 両プロバイダの残量取得手段を実物から確定させた。
 >
@@ -340,90 +341,54 @@ stdio 上の JSON-RPC で会話する。`initialize` でハンドシェイクし
 
 ---
 
-### 6.3 Claude Adapter — statusLine 経由の push を第一手段にする
+### 6.3 Claude Adapter — 任意のタイミングで引ける経路を使う
 
 出典: Claude Code CLI 実行バイナリ内の文字列。詳細は §19-A。
 
-Claude Code には **statusLine** という公開された拡張点があり、
-ユーザが設定したコマンドに JSON を stdin で渡す。
-**この JSON に `rate_limits` が含まれる。** Codex の app-server に相当する、
-文書化された正規の経路がここにある。
+#### 前提: 取得は pull でなければならない
 
-```jsonc
-// statusLine コマンドの stdin に渡る JSON（本アプリが使う部分のみ）
-{
-  "session_id": "…",
-  "rate_limits": {          // サブスク契約者のみ。最初の API 応答の後、
-                            // かつ窓が存在する間だけ現れる
-    "five_hour":   { "used_percentage": 42.0, "resets_at": 1786000000 },
-    "seven_day":   { "used_percentage": 61.5, "resets_at": 1786400000 },
-    "spend_limit": { "used_percentage": 10.0, "resets_at": 1786400000 }
-  }
-}
-```
+Claude Code の **statusLine** は stdin JSON に `rate_limits` を渡してくれるため、
+一時はこれを既定にする案を採った。**しかし採用しない。**
 
-- `used_percentage` は **すでに 0–100**（100 超もありうる）。
-  **`/api/oauth/usage` の `utilization`(0–1) とは違う。** ×100 しない。
-- `resets_at` は **Unix エポック秒**。
-- `five_hour` / `seven_day` はいずれも「API が報告していて、かつ
-  `resets_at` を過ぎていない間だけ」現れる optional フィールド。
+statusLine から値が届くのは「本アプリの statusLine を仕込んだ環境で `claude` を動かしたとき」
+だけである。別のマシン、Claude Code on the web、仕込む前に開始したセッション——
+そうした環境での消費は、こちらで再び `claude` を動かすまで反映されない。
+残量の**絶対値**を見せるアプリで、消費の一部が見えない可能性がある経路を
+既定にはできない（詳細は §20）。
 
-CLI 自身のヘルプにも `jq -r '.rate_limits.five_hour.used_percentage'` を使う
-statusLine の例が載っており、**この用途は想定された使い方である**（§19-A13）。
+したがって Claude 側も **こちらが任意のタイミングでサーバ側の状態を引ける経路**でなければならない。
+以下の 2 つを実装し、既定と代替の関係に置く。
 
-#### 取り込みの仕組み
+| | 経路 | 位置づけ |
+|---|---|---|
+| 既定 | `GET /api/oauth/usage` | 速く、JSON で確実にパースできる |
+| 代替 | `claude` を PTY で起動し `/usage` を読む | 公式 UI のみを使う。既定が壊れたときの受け皿 |
 
-本アプリのバイナリに `llm-limits statusline` サブコマンドを持たせ、
-ユーザにはこれを statusLine として登録してもらう。
+**この 2 つは壊れ方が独立している。** 前者はエンドポイントの仕様変更で、
+後者は TUI のレイアウト変更で壊れる。片方が死んでももう片方が残るため、
+R3（非公開 IF への依存）に対する実質的な二重化になる。
 
-```jsonc
-// ~/.claude/settings.json
-{ "statusLine": { "type": "command", "command": "llm-limits statusline" } }
-```
-
-このサブコマンドは、
-
-1. stdin の JSON を読む
-2. `rate_limits` を `POST /api/v1/ingest/claude` へ転送する（§10.1）
-3. **stdout に表示用の文字列を返す**（例: `5h:42% 7d:62%`）
-
-3 を行うのが要点で、**ユーザ自身の statusLine としても役に立つ**ため、
-「本アプリのためだけに設定を汚す」形にならない。
-
-サブコマンドの制約:
-
-- サーバへの POST は**タイムアウト 300ms、失敗しても黙って続行**する。
-  statusLine は対話体験の一部であり、本アプリの都合で `claude` を遅くしてはならない。
-- サーバの Bearer トークンは `<config_dir>/llm-limits/api.token` から読む（§13.2）。
-- 標準エラーに何も出さない（statusLine の描画を壊さないため）。
-
-#### この経路の制約（正直に書く）
-
-| 制約 | 影響と対処 |
-|---|---|
-| **Claude Code のセッションが動いている間しか届かない** | アイドル時は更新されない。最終値を `Stale=true` で保持し「最終取得 N 分前」を出す |
-| 最初の API 応答の前は `rate_limits` が無い | セッション開始直後は値が来ない。既存の最終値を出し続ける |
-| ペイロードにアカウント識別子が無い | サブコマンドが自身の `CLAUDE_CONFIG_DIR`（未設定なら既定）を併せて送り、それをアカウントの識別子にする |
-| 複数セッションが同時に走る | 同一アカウントに複数の更新が届く。`fetched_at` が最新のものを採用する |
-
-`resets_at` を過ぎた後は、その窓がリセットされたことが**分かる**。
-UI ではこれを「リセット済み（推定）」として、**実測値と区別して**表示する
-（0% と断定しない。リセット後にすでに消費している可能性があるため）。
-
-#### 副次手段: `/api/oauth/usage`（既定では無効）
-
-常時更新がどうしても必要な場合のために、公式 CLI のクレデンシャルを使って
-`GET https://api.anthropic.com/api/oauth/usage` を叩く経路も実装するが、
-**既定では無効**とし、設定で明示的に有効化させる。
-非公開エンドポイントであることを設定画面に明記する。
+#### 既定: `GET /api/oauth/usage`
 
 ```
 GET https://api.anthropic.com/api/oauth/usage?at_wall=1&skip_spend=1
+
 Authorization: Bearer <access_token>
 anthropic-beta: oauth-2025-04-20
+Content-Type: application/json
 ```
 
-トークンの入手経路（優先順）:
+タイムアウト 5 秒（CLI と同じ）。読み取り専用で、利用枠を消費しない。
+
+> **§2 との関係を明確にしておく。**
+> このリクエストに **`client_id` は一切登場しない**。Bearer トークンと beta ヘッダだけである。
+> client_id が必要になるのは OAuth の**ログインとリフレッシュ**であり、
+> 本アプリはそのどちらも行わない（下記）。
+> したがって §2 が禁じたクライアントなりすましは、この経路では発生しない。
+> 残る問題は「**エンドポイントが文書化されていない**」の一点だけであり、
+> これは §2.2 の 4 番目の項目に当たる。程度の違う話として区別して扱う。
+
+**トークンの入手経路（優先順）**
 
 | 順位 | 経路 | 位置づけ |
 |---|---|---|
@@ -431,49 +396,86 @@ anthropic-beta: oauth-2025-04-20
 | 2 | 環境変数 `CLAUDE_CODE_OAUTH_TOKEN` | 同上を環境変数で渡す形 |
 | 3 | `$CLAUDE_CONFIG_DIR ?? ~/.claude` 配下の `.credentials.json` | CLI のログイン結果を読む |
 
-**トークンのリフレッシュは自前でしない。** 経路 3 では期限切れの更新を `claude` CLI に委ね、
-ファイルの **mtime を監視**して読み直す（CLI 自身も同じ方法で更新を検知している。§19-A7）。
-本アプリからトークンエンドポイントを叩かない（リフレッシュトークンのローテーションを
-CLI と奪い合うと、CLI 側のログインを壊しうるため）。
+**トークンのリフレッシュを自前でしない。**
+経路 3 では期限切れの更新を `claude` CLI に委ね、ファイルの **mtime を監視**して読み直す
+（CLI 自身も同じ方法で更新を検知している。§19-A7）。
+本アプリからトークンエンドポイントを叩かない。リフレッシュトークンのローテーションを
+CLI と奪い合うと CLI 側のログインを壊しうるためであり、
+同時にこれが「client_id を使わない」ことの担保にもなっている。
+
+401 を受けたら「`claude` CLI を一度起動してログイン状態を更新してください」と UI に出す。
+経路 1 の長期トークンではリフレッシュ自体が不要で、この問題が起きない。
+**経路 1 を既定の案内にする理由がこれである。**
 
 macOS では CLI が Keychain にクレデンシャルを置く場合がある。
 **Keychain 上のサービス名は未確認**のため、確認できるまで macOS では経路 1 のみを提示する。
 
-レスポンスの正規化（この経路のみ）:
+**レスポンス**
 
 ```json
 {
-  "five_hour":  { "utilization": 0.42,  "resets_at": 1786000000 },
-  "seven_day":  { "utilization": 0.615, "resets_at": 1786400000 },
-  "seven_day_opus": { "utilization": 0.10, "resets_at": 1786400000 }
+  "five_hour":            { "utilization": 0.42,  "resets_at": 1786000000 },
+  "seven_day":            { "utilization": 0.615, "resets_at": 1786400000 },
+  "seven_day_opus":       { "utilization": 0.10,  "resets_at": 1786400000 },
+  "seven_day_sonnet":     { "utilization": 0.55,  "resets_at": 1786400000 },
+  "seven_day_oauth_apps": { "utilization": 0.02,  "resets_at": 1786400000 },
+  "overage":              { "utilization": 0.0,   "resets_at": 1786400000 }
 }
 ```
 
-**`utilization` は 0.0–1.0 の小数。`UsedPercent` へは ×100 する。**
-statusLine 経路と単位が違うため、**正規化は経路ごとに別関数に分け、
-それぞれに回帰テストを置く**（§16）。
+1. `utilization` は **0.0–1.0 の小数**。`UsedPercent` へは **×100** する
+   （CLI 内にも `used_percentage: utilization * 100` の換算がある）。
+   **Codex の `usedPercent`(0–100) とはスケールが違う。**
+2. `resets_at` は **Unix エポック秒**。
+
+#### 代替: `claude` の `/usage` を PTY で読む
+
+既定が `ErrSchema` を繰り返す状態になったとき、設定で切り替えられるようにする。
+
+1. `openpty(3)` で擬似端末を開き、`claude` をその中で起動する
+2. `/usage` を送り、「Show plan usage limits」相当の選択を確定する
+3. 描画された画面から 5時間枠・週間枠の使用率とリセット時刻を読む
+
+**利点**: クレデンシャルを一切扱わず、client_id も使わず、非公開 HTTP も叩かない。
+公式 CLI の公式コマンドを人間の代わりに実行しているだけになる。
+
+**代償**（設計に織り込む必要がある）:
+
+| 問題 | 対処 |
+|---|---|
+| TUI は API ではない。レイアウト変更で壊れる | パーサを 1 ファイルに隔離し、testdata に実画面を固定する |
+| 起動が遅い（秒単位） | 既定間隔を 5 分に伸ばす。UI 非表示時はさらに抑制 |
+| プローブがセッション履歴を汚す | 固定のセッション ID を再利用し、生成物は毎回後始末する |
+| 多重起動 | アカウントごとに 1 本に直列化し、最短間隔を設ける |
+| PTY は UTF-8 の途中で分割されうる | キャリーバッファを持ってから行単位に組み直す |
+| Windows に `openpty` がない | ConPTY を使う。実装できるまで Windows ではこの経路を出さない |
+
+**この経路が枠を消費するかは未検証**（§18）。消費する場合は間隔をさらに伸ばす。
 
 #### Window のマッピング
 
 Claude は窓の長さを返さないため、**キー名で分類**する。
 
-| キー | 経路 | `Kind` | `Label` | 既定表示 |
-|---|---|---|---|---|
-| `five_hour` | 両方 | `five_hour` | 5時間枠 | ✅ |
-| `seven_day` | 両方 | `weekly` | 週間枠 | ✅ |
-| `spend_limit` | statusLine | `other` | 上限額 | 詳細のみ |
-| `seven_day_opus` 他 | usage API | `other` | 週間枠(Opus) 等 | 詳細のみ |
+| キー | `Kind` | `Label` | 既定表示 |
+|---|---|---|---|
+| `five_hour` | `five_hour` | 5時間枠 | ✅ |
+| `seven_day` | `weekly` | 週間枠 | ✅ |
+| `seven_day_opus` | `other` | 週間枠(Opus) | 詳細のみ |
+| `seven_day_sonnet` | `other` | 週間枠(Sonnet) | 詳細のみ |
+| `seven_day_oauth_apps` | `other` | 週間枠(OAuth Apps) | 詳細のみ |
+| `overage` | `other` | 追加利用 | 詳細のみ |
 
 未知のキーは `other` として取り込み、落とさない。
+`five_hour` と `seven_day` の欠落のみ `ErrSchema` とする。
 
 
 ### 6.4 依存する非公開インタフェースについて
 
-**既定の構成では、非公開インタフェースへの依存はゼロになった。**
-Codex は app-server、Claude は statusLine と、いずれも公開された拡張点だけで完結する。
+**Codex 側は公開インタフェースだけで完結する**（app-server）。
+**Claude 側の `/api/oauth/usage` は文書化されていない**。この一点が残る。
 
-`/api/oauth/usage` は §6.3 の副次手段としてのみ残り、**既定では無効**である。
-有効化した場合にのみ以下が当てはまる。
+ただし §6.3 の通り、これは client_id のなりすましとは別種の問題であり、
+PTY 経由の代替経路（公式 UI のみを使う）を持つことで二重化してある。
 
 - `ErrSchema` を明示的に検出・ログ化し、仕様変更に気づける状態を保つ（§14.2）
 - リクエスト量は公式クライアントの通常利用を上回らない水準に抑える（§9.2）
@@ -615,40 +617,32 @@ sequenceDiagram
 **ポート 1455 の bind は app-server の責務**なので、本アプリは関与しない
 （v2 で設計した一時待受は不要になった）。
 
-### 8.2 Claude: statusLine の設定（ログインは不要）
+### 8.2 Claude: トークンの投入、または既存ログインの読み取り
 
-Claude 側は**そもそもログインが要らない**。本アプリは認証情報を一切扱わず、
-statusLine から流れてくる値を受け取るだけである（§6.3）。
-追加画面の役割は「設定手順の案内」になる。
+Claude は自前の OAuth を実装しないため、追加画面はトークンの受け取りになる。
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ Claude アカウントを追加                               │
-├──────────────────────────────────────────────────────┤
-│ Claude Code の statusLine から残量を受け取ります。     │
-│ 認証情報は扱いません。                                 │
-│                                                       │
-│ ~/.claude/settings.json に次を追加してください：       │
-│   "statusLine": {                                     │
-│     "type": "command",                                │
-│     "command": "llm-limits statusline"                │
-│   }                                          [コピー] │
-│                                                       │
-│ [ 自動で追加する ]  ← 既存の statusLine 設定がない場合 │
-│                                                       │
-│ 状態: ⏳ Claude Code セッションからの受信を待機中…      │
-│                                                       │
-│                                        [ 閉じる ]     │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│ Claude アカウントを追加                         │
+├────────────────────────────────────────────────┤
+│ ● 長期トークンを使う（推奨）                     │
+│   ターミナルで次を実行し、表示された値を貼り付け： │
+│     $ claude setup-token                        │
+│   [                                        ]    │
+│                                                 │
+│ ○ ログイン済みの claude CLI の情報を使う          │
+│   ~/.claude/.credentials.json を読み取ります。   │
+│   （書き込みは行いません）                        │
+│   ✓ 検出済み                                    │
+│                                                 │
+│                          [ キャンセル ] [ 追加 ] │
+└────────────────────────────────────────────────┘
 ```
 
-- **「自動で追加する」は既存の `statusLine` 設定が無い場合のみ有効化する。**
-  ユーザが自分で設定した statusLine を本アプリが黙って上書きしてはならない。
-  既存設定がある場合はスニペットの提示のみに留め、統合方法を案内する。
-- 待機中に最初のペイロードが届いた時点でアカウントを登録する
-  （`CLAUDE_CONFIG_DIR` を識別子とする。§6.3）。
-- 副次手段（`/api/oauth/usage`）を使う場合のトークン投入欄は、
-  設定画面の「詳細」以下に置き、既定では畳んでおく。
+- 既定は「長期トークン」。ユーザの意図が明示的で、リフレッシュ競合も起きないため（§6.3）。
+- 下の選択肢は検出できた場合のみ有効化し、**何を読むかをパスまで明示する**。
+- どちらも選べない場合（CLI 未導入）は `ErrNotInstalled` として導入手順を出す。
+- PTY 経路（§6.3 の代替）を選んだ場合はトークンが不要になるため、この画面はスキップする。
 
 ---
 
@@ -679,14 +673,15 @@ Codex は `windowDurationMins` でこれを使い、Claude はキー名で分類
 
 | Provider | 方式 | 間隔 |
 |---|---|---|
-| Codex | **push**（`account/rateLimits/updated`） | 定期取得なし。起動時 + 通知が30分途絶えたときの保険のみ |
-| Claude（既定） | **push**（statusLine からの ingest） | 定期取得なし。`claude` セッションが動いている間だけ届く |
-| Claude（副次手段を有効化した場合のみ） | ポーリング | 既定 60 秒 |
+| Codex | **push**（`account/rateLimits/updated`） | 定期取得なし。起動時 + 通知が30分途絶えたときの保険のみ。`account/rateLimits/read` は実サーバ呼び出しなので、必要ならいつでも引ける（§19-C11） |
+| Claude（既定: usage API） | ポーリング | 既定 60 秒 |
+| Claude（代替: PTY） | ポーリング | 既定 5 分（起動コストが高いため。§6.3） |
 
-**既定では両 Provider とも push であり、定期ポーリングは行わない。**
-非公開エンドポイントを叩かないだけでなく、そもそも本アプリからの外向き通信が無くなる（§13.4）。
+**Codex が push で済み Claude がポーリングになるのは非対称だが、これは正しい非対称である。**
+Codex は app-server が更新を通知してくれるうえ、必要なら任意のタイミングで引ける。
+Claude には通知の口が無いため、こちらから引くしかない。
 
-副次手段を有効化した場合の Claude のポーリングは次のように調整する。
+Claude のポーリングは次のように調整する。
 
 ```
 interval = max(60s, userConfiguredInterval)
@@ -742,8 +737,7 @@ UI は値をグレーアウトし「最終取得: N 分前」を表示する。*
 | GET | `/api/v1/accounts` | アカウント一覧 |
 | POST | `/api/v1/accounts/codex/login` | app-server 経由でログイン開始（§8.1） |
 | DELETE | `/api/v1/accounts/codex/login/{login_id}` | ログイン中断 |
-| POST | `/api/v1/ingest/claude` | **statusLine からの残量受信**（§6.3）。Bearer 必須 |
-| POST | `/api/v1/accounts/claude` | 副次手段のトークン投入（§6.3、既定では未使用） |
+| POST | `/api/v1/accounts/claude` | トークン投入 or 既存クレデンシャル採用（§8.2） |
 | PATCH | `/api/v1/accounts/{id}` | `label` / `disabled` の更新 |
 | DELETE | `/api/v1/accounts/{id}` | 本アプリの管理対象から外す（**CLI 側はログアウトさせない**） |
 | GET | `/api/v1/quotas` | 全アカウントの最新 Snapshot |
@@ -755,28 +749,7 @@ UI は値をグレーアウトし「最終取得: N 分前」を表示する。*
 `DELETE /accounts/{id}` が CLI 側のログアウトを行わないのは重要な点で、
 本アプリの都合で公式 CLI の状態を壊さないため。UI にもその旨を書く。
 
-### 10.2 `POST /api/v1/ingest/claude`
-
-`llm-limits statusline` サブコマンドが送るリクエスト。
-
-```json
-{
-  "config_dir": "/Users/me/.claude",
-  "session_id": "…",
-  "rate_limits": {
-    "five_hour": { "used_percentage": 42.0, "resets_at": 1786000000 },
-    "seven_day": { "used_percentage": 61.5, "resets_at": 1786400000 }
-  }
-}
-```
-
-- `config_dir` がアカウントの識別子になる（`Account.Subject`）。未知なら新規登録する。
-- `rate_limits` が欠落・空のリクエストは 204 を返して**何もしない**
-  （セッション開始直後は正常に起こる。§6.3）。
-- レスポンスは表示用の短い文字列を含めてもよいが、
-  **サブコマンドはレスポンスを待たずに終了してよい**（タイムアウト 300ms）。
-
-### 10.3 `GET /api/v1/quotas` レスポンス
+### 10.2 `GET /api/v1/quotas` レスポンス
 
 ```json
 {
@@ -814,7 +787,7 @@ UI は値をグレーアウトし「最終取得: N 分前」を表示する。*
 
 クライアントは `kind` で分岐する。**キー名で分岐してはならない。**
 
-### 10.4 SSE (`GET /api/v1/stream`)
+### 10.3 SSE (`GET /api/v1/stream`)
 
 ```
 event: snapshot
@@ -924,8 +897,8 @@ app-server を子プロセスとして動かすため、v2 に無かった考慮
 | ローカル API | 同一端末の他プロセスからの利用 | `127.0.0.1` バインド + Bearer トークン |
 | ローカル API | 悪意あるサイトからの CSRF / DNS リバインディング | Origin 検証 + `Host` 検証 + Bearer |
 | 子プロセス | 引数・環境変数経由の注入 | 引数固定、環境変数は最小（§12） |
-| ingest エンドポイント | 他プロセスによる偽の残量投入 | Bearer 必須。値は表示専用で、これを根拠に何かを実行することはない |
-| ユーザの `settings.json` | 本アプリによる既存設定の破壊 | 既存 `statusLine` がある場合は**自動書き換えしない**（§8.2） |
+| Claude 長期トークン | 他プロセスからの読み出し | OS キーチェーン（§7.2） |
+| CLI のクレデンシャル | 本アプリによる破壊 | **読み取り専用**。書き込みもリフレッシュもしない（§6.3） |
 
 ### 13.2 ローカル API トークン
 
@@ -944,9 +917,9 @@ app-server を子プロセスとして動かすため、v2 に無かった考慮
 
 ### 13.4 その他
 
-- **既定構成では本アプリからの外向き通信は一切ない。**
-  Codex 分は app-server が、Claude 分は `claude` 本体が行い、本アプリは結果を受け取るだけ。
-  §6.3 の副次手段を有効化したときのみ `api.anthropic.com` への通信が発生する
+- 本アプリからの外向き通信は `api.anthropic.com` のみ（Claude の既定経路）。
+  Codex 分は app-server が行うため本アプリからは出ない。
+  Claude を PTY 経路に切り替えた場合は本アプリからの外向き通信もゼロになる
 - テレメトリ・クラッシュレポートの送信は行わない
 
 ---
@@ -1002,9 +975,7 @@ Linux `$XDG_CONFIG_HOME`（既定 `~/.config`）、Windows `%APPDATA%`。
 
 ```
 llm-limits/
-├── cmd/llm-limits/
-│   ├── main.go
-│   └── statusline.go             # `llm-limits statusline` サブコマンド (§6.3)
+├── cmd/llm-limits/main.go
 ├── internal/
 │   ├── server/
 │   │   ├── router.go
@@ -1026,11 +997,12 @@ llm-limits/
 │   │   │   ├── normalize.go
 │   │   │   └── normalize_test.go
 │   │   └── claude/
-│   │       ├── statusline.go     # ingest ペイロードの正規化 (既定経路)
-│   │       ├── statusline_test.go
-│   │       ├── creds.go          # 副次手段: setup-token / credentials.json / mtime 監視
-│   │       ├── usage.go          # 副次手段: /api/oauth/usage
-│   │       └── usage_test.go
+│   │       ├── creds.go          # setup-token / credentials.json / mtime 監視
+│   │       ├── usage.go          # 既定: /api/oauth/usage
+│   │       ├── usage_test.go
+│   │       ├── pty.go            # 代替: claude を PTY で起動し /usage を読む
+│   │       ├── pty_parse.go      # 画面パーサ (隔離)
+│   │       └── pty_parse_test.go
 │   ├── procmgr/                  # §12 の子プロセス共通処理
 │   ├── store/{sqlite.go,keychain.go,migrations/}
 │   └── config/config.go
@@ -1049,10 +1021,9 @@ llm-limits/
 |---|---|
 | codex Adapter | app-server を**偽の子プロセス**（テスト用スタブバイナリ）に差し替え、JSON-RPC の往復を検証。実際の `codex` は起動しない |
 | codex Adapter | 異常終了・再起動・通知途絶のシナリオをスタブから駆動 |
-| claude Adapter (statusLine) | 実際の statusLine ペイロードを testdata に固定。`rate_limits` 欠落・部分欠落・100超の値を含める |
 | claude Adapter (usage API) | 実 API から一度採取したレスポンスを testdata に固定。**ネットワークに出ない** |
-| statusline サブコマンド | サーバ停止中・タイムアウト時に**非ゼロ終了せず、stderr にも出さず、stdout の表示文字列だけ返す**ことを検証 |
-| 単位換算 | **経路ごとに独立した回帰テスト**を置く。statusLine の `used_percentage`(0–100)、usage API の `utilization`(0–1)、Codex の `usedPercent`(0–100) |
+| claude Adapter (PTY) | 実際の `/usage` 画面を testdata に固定してパーサを検証。UTF-8 が途中で分割された入力、描画途中の未完成画面、想定外レイアウトを含める |
+| 単位換算 | **経路ごとに独立した回帰テスト**を置く。usage API の `utilization`(0–1) と Codex の `usedPercent`(0–100) |
 | classify | 300分→5h、10080分→weekly、境界（±5%）と想定外値 |
 | Scheduler | `clock` を注入し、バックオフ・リセット寄せを検証 |
 | Store | 一時ディレクトリの SQLite。キーチェーンはインメモリ実装に差し替え |
@@ -1074,8 +1045,9 @@ llm-limits/
 | P1b | `account/rateLimits/read` + `updated` 購読 + 正規化 | `codex` の TUI 表示と値が一致する |
 | P1c | Web UI ダッシュボード + SSE | 5h/週間の消費率とリセット時刻がリアルタイム更新される |
 | P1d | `account/login/start` によるログイン導線（§8.1） | Web 画面から Codex アカウントを追加できる |
-| P2a | Claude: `statusline` サブコマンド + ingest（§6.3） | `claude` を動かすとダッシュボードに 5h/週間が出る |
-| P2b | Claude: 副次手段（setup-token + `/api/oauth/usage`）を opt-in で追加 | 有効化時に `claude` の `/usage` と値が一致する |
+| P2a | Claude: setup-token + `/api/oauth/usage`（既定経路） | `claude` の `/usage` と値が一致する |
+| P2b | Claude: credentials.json 経路 + mtime 監視 | CLI 側のリフレッシュに追随する |
+| P2c | Claude: PTY 経路（代替） | 既定経路を無効にしても同じ値が出る |
 | P3 | 設定画面、複数 CODEX_HOME、history、リリースワークフロー | 3 OS のバイナリが CI から出る |
 | P4 | Tauri メニューバークライアント | 本設計の対象外（別途設計） |
 
@@ -1093,9 +1065,9 @@ push があるためコア（正規化・SSE・UI）の検証台として速い*
 |---|---|---|---|
 | R1 | **公式 CLI のインストールが前提**になった | 導入の敷居が上がる | `/api/v1/providers` で検出状況と導入手順を明示。これは §2 の判断の代償として受け入れる |
 | R2 | app-server の JSON-RPC が将来変わる | 機能停止 | 起動時にバージョンを記録。`ErrSchema` 検出と `/debug/rpc`（§14.2）。加えて上流 schema の定期取得と生成物 diff で**変更を能動検知**する（§5.2、`schema-drift.yml`） |
-| R3 | **Claude の値が `claude` 実行中しか更新されない** | アイドル時に値が古くなる | `Stale` と「最終取得 N 分前」を明示。`resets_at` 経過後は「リセット済み（推定）」と区別表示（§6.3）。常時更新が要る場合のみ副次手段を opt-in |
-| R3b | Claude の `/api/oauth/usage` は非公開 | 機能停止 | **既定では使わない**ため既定構成には影響しない。有効化時のみ `ErrSchema` 検出 |
-| R4 | ユーザの `statusLine` 設定を壊す | 既存の統計表示が消える | 既存設定があれば自動書き換えしない（§8.2）。副次手段の credentials.json は読み取り専用に徹する |
+| R3 | Claude の `/api/oauth/usage` は非公開 | 機能停止 | `ErrSchema` 検出（§14.2）。**壊れ方の独立した PTY 経路**を代替として持つ（§6.3） |
+| R3b | PTY 経路は TUI のレイアウト変更で壊れる | 代替が使えない | パーサを隔離し実画面を testdata に固定。既定経路と同時に壊れる可能性は低い |
+| R4 | Claude の credentials.json 読み取りが CLI と競合 | CLI 側のログイン破壊 | **読み取り専用に徹する**（§6.3）。既定の案内は setup-token 経路 |
 | R5 | app-server の複数アカウント API が未接続 | 複数アカウントが煩雑 | `CODEX_HOME` を分ける方式で回避。将来 API が通れば単一プロセス化する |
 | R6 | 単位スケールの取り違え | 100倍ずれた値の表示 | 換算を Adapter 内に閉じ、§16 の回帰テストで固定 |
 | R7 | 子プロセスのリーク・ゾンビ | 常駐アプリとして致命的 | §12 の終了処理。E2E で異常終了シナリオを回す |
@@ -1138,7 +1110,8 @@ push があるためコア（正規化・SSE・UI）の検証台として速い*
 | A12 | その下位フィールド。`five_hour`（「Optional: 5-hour session limit (present only while the API reports it and its resets_at has not passed)」）、`seven_day`、`spend_limit`。各々 `used_percentage: number // Percentage of the limit used (0-100, above 100 once exceeded)` と `resets_at: number // Unix epoch seconds when this window resets` |
 | A13 | **CLI 同梱の statusLine 例が `rate_limits` を使っている**: `jq -r '.rate_limits.five_hour.used_percentage'` / `.rate_limits.seven_day.used_percentage` / `.rate_limits.spend_limit.used_percentage` → 想定された使い方である根拠 |
 | A14 | statusLine の設定項目に `timeoutMs` / `refreshIntervalMs` / `outputBehavior` / `path` / `script` / `interpreter` が存在 |
-| A15 | statusLine ペイロードにアカウント／組織／メールの識別子は見当たらない（`session_id` はある）→ §6.3 で `CLAUDE_CONFIG_DIR` を識別子に使う理由 |
+| A15 | statusLine ペイロードにアカウント／組織／メールの識別子は見当たらない（`session_id` はある） |
+| A16 | CLI サブコマンドに `/usage` 相当の非対話コマンドは無く、`/usage` は対話 TUI 専用 → §6.3 の代替経路が PTY になる理由 |
 
 ### B. Codex（公開インタフェース＝本設計が依存する部分）
 
@@ -1170,3 +1143,55 @@ push があるためコア（正規化・SSE・UI）の検証台として速い*
 **C8 の含意**: Codex CLI 自身が「primary = 5時間」と決め打ちせず窓の長さから
 ラベルを導出している。本設計が §9.1 で `classifyByLength` を採る根拠がこれで、
 `primary`/`secondary` という位置に意味を持たせるべきではない。
+
+---
+
+## 20. 採用しなかった案の記録
+
+設計が二転三転したため、**なぜその案を採らなかったか**を残す。
+同じ案を再検討するときに、同じ調査を繰り返さないためのもの。
+
+### 20.1 公式クライアントの client_id を流用して自前 OAuth を持つ
+
+§2 の通り。クライアントなりすましに当たるため不採用。
+商用の同種アプリ（CodexBar）はこの方式を採っており、Codex の `originator` ヘッダに
+`codex_cli_rs` や `"Codex Desktop"` を送っている。後者は `is_first_party_originator()` の
+`starts_with("Codex ")` を通る値であり、判定を意識して選ばれている。
+**技術的に可能であることと、やってよいことは別**という判断。
+
+なお `/api/oauth/usage` を Bearer トークンだけで叩く行為は client_id を使わないため、
+これとは別の話である（§6.3 の注記）。
+
+### 20.2 Claude の statusLine を既定の取得経路にする
+
+Claude Code の statusLine は stdin JSON に `rate_limits`（`five_hour` / `seven_day` /
+`spend_limit`、`used_percentage` は 0–100、`resets_at` はエポック秒）を渡す。
+文書化された拡張点で、CLI 同梱の設定例自身がこのフィールドを参照している（§19-A11〜A14）。
+認証情報を扱わず、非公開エンドポイントも叩かない、という点では最も筋がよい。
+
+**不採用の理由**: 値が届くのは「本アプリの statusLine を仕込んだ環境で `claude` を
+動かしたとき」だけである。
+
+- 別のマシンで使った分は、こちらで `claude` を動かすまで反映されない
+- Claude Code on the web など、statusLine を仕込めない環境の消費は拾えない
+- 仕込む前に開始したセッションの分も落ちる
+
+残量の**絶対値**を表示するアプリで、消費の一部が見えない可能性のある経路を既定にはできない。
+「作業中は正しいが、離席明けに信用できない値が出る」という壊れ方が最も悪い。
+
+補助的な push として併用する案も検討したが、既定が pull（§6.3）である以上
+得られる鮮度の向上はわずかで、`llm-limits statusline` サブコマンド・ingest API・
+ユーザの `settings.json` への介入という設計面積に見合わないため入れていない。
+
+### 20.3 ブラウザの claude.ai セッション Cookie を読む
+
+CodexBar が持つ経路（`GET https://claude.ai/api/organizations/{org_id}/usage`）。
+Safari の Cookie を読むために Full Disk Access が必要になる。
+**ユーザに要求する権限に対して見返りが小さい**ため不採用。
+§6.3 の 2 経路で足りている。
+
+### 20.4 Codex で `/wham/usage` を直接叩く
+
+app-server 経由（§6.2）で同じ値が公開インタフェースから得られるため不要。
+複数アカウントの扱いだけは直接叩く方が素直だが（CodexBar もそれを理由に直接叩いている）、
+`CODEX_HOME` を分ける方式で回避できる（§6.2、R5）。
