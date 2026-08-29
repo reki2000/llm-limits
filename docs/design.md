@@ -13,6 +13,10 @@ Claude（Anthropic サブスクリプション）と Codex（ChatGPT サブス�
 > Claude は公式 CLI が管理するクレデンシャルを使う方式に変更した（§7）。
 >
 > v2 での変更: 両プロバイダの残量取得手段を実物から確定させた。
+>
+> あわせて技術選定を再検討した。v1 で Go を選んだ理由のうち 2 つ（キーチェーン抽象、
+> 自前 OAuth の暗号処理）は v3 で失効したが、単一バイナリ・低メモリ・子プロセス管理という
+> 常駐デーモンとしての理由が残るため Go を継続する。詳細と却下した代替は §5.1。
 
 ---
 
@@ -157,23 +161,68 @@ flowchart LR
 
 ### 5.1 サーバ: Go
 
-- cgo なしでクロスコンパイル可能 → 3 OS 向けに単一バイナリを配布できる
-- 常駐時のメモリフットプリントが小さい
-- **子プロセスの stdio JSON-RPC 管理**（app-server 駆動に必須）が標準ライブラリで完結する
+v3 で自前 OAuth とトークン保存が無くなったため、**v1 で挙げた選定理由のうち 2 つは失効した**
+（OS キーチェーン抽象が 3 OS 揃うこと、PKCE 等の暗号処理）。
+再検討したうえで Go を継続する。判断が変わっていないことより、
+**なぜ今も妥当なのか**が重要なので、現時点の理由を書き直す。
+
+**継続する理由**
+
+1. **単一静的バイナリ**（cgo なし、約 15MB）。CI から 3 OS 分をクロスコンパイルでき、
+   配布物が 1 ファイルで済む。P2 のメニューバーアプリが子プロセスとして起動する
+   常駐デーモンであり、ランタイムの同梱が要らないことが効く。
+2. **常駐時のメモリフットプリントが小さい**（想定 20–30MB）。常時起動が前提のため。
+3. **長命な子プロセスの管理**が標準ライブラリで完結する。v3 で app-server 駆動になり、
+   SIGTERM→SIGKILL、異常終了時の再起動、ゾンビ回収、3 OS でのプロセスツリー終了が
+   中核の関心事になった（§12）。**これは v3 で新たに増えた Go 寄りの要素である。**
 
 | 用途 | ライブラリ |
 |---|---|
 | HTTP | 標準 `net/http` |
 | DB | `modernc.org/sqlite`（pure Go / cgo 不要） |
 | ログ | 標準 `log/slog` |
+| キーチェーン | `github.com/zalando/go-keyring`（**Claude の長期トークン 1 件のみ**。§7.2） |
 
-キーチェーンライブラリは **不要になった**（本アプリはトークンを保存しないため。§7）。
+### 5.2 app-server プロトコル型の生成
 
-### 5.2 Web UI: 素の TS + Vite
+`openai/codex` は app-server v2 プロトコルの **完全な JSON Schema** を同梱している
+（`codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json`、
+616 定義。`GetAccountRateLimitsResponse` / `RateLimitSnapshot` / `RateLimitWindow` を含む）。
+
+**これを vendor し、`go-jsonschema` で型を生成する。手書きしない。**
+
+```
+schema/codex_app_server_protocol.v2.schemas.json   # vendor（版を固定）
+internal/adapter/codex/gen/                        # 生成物（コミットする）
+```
+
+```makefile
+# make gen-codex-protocol
+gen-codex-protocol:
+	go-jsonschema -p gen --tags json 	  schema/codex_app_server_protocol.v2.schemas.json 	  -o internal/adapter/codex/gen/protocol.go
+```
+
+**生成物をコミットするのは、差分がプロトコル変更の検知器になるため。**
+schema を更新して `make gen-codex-protocol` を回し、diff が出れば
+上流の変更が可視化される。これが R2（プロトコル変更で壊れる）への能動的な備えになる。
+
+> 生成ステップが不要な選択肢として TypeScript も検討した。上流は生成済みの `.ts` 型も
+> 同梱している（`schema/typescript/v2/` に 608 ファイル）ため、そのまま取り込める。
+> ただし JSON Schema があるため型の入手は Go でも 1 コマンドで済み、差は生成ステップの
+> 有無だけだった。`@openai/codex-sdk` は thread/exec 専用で `account/rateLimits` を
+> 含まないため、TS を選んでも JSON-RPC クライアントは自前になる点も変わらない。
+> 一方で常駐バイナリのサイズ（`bun build --compile` で 60–100MB）と Windows での
+> 子プロセス終了の作り込みが増えるため、採用しなかった。
+>
+> P2 の Tauri が確定するなら Rust に寄せて P1/P2 を 1 プロセスに畳む案もあるが、
+> 実装速度を優先して見送った。
+
+### 5.3 Web UI: 素の TS + Vite
 
 画面数が 2 つ、状態も Snapshot のリストのみ。ビルド成果物は Go の `embed.FS` に載せる。
+サーバと言語が分かれるが、この規模では許容する。
 
-### 5.3 メニューバー常駐（P2 の方針のみ）: Tauri v2
+### 5.4 メニューバー常駐（P2 の方針のみ）: Tauri v2
 
 サーバとは REST/SSE のみで会話するため、後で Electron に翻意しても設計への影響はない。
 
@@ -886,7 +935,7 @@ llm-limits/
 │   │   ├── adapter.go
 │   │   ├── codex/
 │   │   │   ├── appserver.go      # 子プロセス管理 + JSON-RPC
-│   │   │   ├── rpc_types.go      # account/* の型
+│   │   │   ├── gen/protocol.go   # JSON Schema からの生成物 (§5.2)。手書きしない
 │   │   │   ├── normalize.go
 │   │   │   └── normalize_test.go
 │   │   └── claude/
@@ -896,9 +945,11 @@ llm-limits/
 │   ├── procmgr/                  # §12 の子プロセス共通処理
 │   ├── store/{sqlite.go,keychain.go,migrations/}
 │   └── config/config.go
+├── schema/                       # vendor した app-server JSON Schema (§5.2)
 ├── web/                          # Vite。dist を go:embed
 ├── docs/design.md                # 本書
-└── .github/workflows/release.yml
+├── Makefile                      # gen-codex-protocol 等
+└── .github/workflows/{release.yml,schema-drift.yml}
 ```
 
 ---
@@ -916,6 +967,7 @@ llm-limits/
 | Store | 一時ディレクトリの SQLite。キーチェーンはインメモリ実装に差し替え |
 | API | `httptest` でミドルウェア（Bearer 欠落 403、不正 Origin 403）を検証 |
 | E2E | app-server スタブ + Claude API スタブで、追加〜表示まで通す |
+| 型生成 | `make gen-codex-protocol` の出力がコミット済み生成物と一致することを CI で検証。差分は「vendor した schema と生成物がずれている」ことを意味する |
 
 **単位換算のテストを明示しているのは、`utilization`(0–1) と `usedPercent`(0–100) の
 取り違えが「100倍ずれた値を自信を持って表示する」形の障害になるため。**
@@ -949,7 +1001,7 @@ push があるためコア（正規化・SSE・UI）の検証台として速い*
 | # | 項目 | 影響 | 対応方針 |
 |---|---|---|---|
 | R1 | **公式 CLI のインストールが前提**になった | 導入の敷居が上がる | `/api/v1/providers` で検出状況と導入手順を明示。これは §2 の判断の代償として受け入れる |
-| R2 | app-server の JSON-RPC が将来変わる | 機能停止 | 起動時にバージョンを記録。`ErrSchema` 検出と `/debug/rpc`（§14.2） |
+| R2 | app-server の JSON-RPC が将来変わる | 機能停止 | 起動時にバージョンを記録。`ErrSchema` 検出と `/debug/rpc`（§14.2）。加えて上流 schema の定期取得と生成物 diff で**変更を能動検知**する（§5.2、`schema-drift.yml`） |
 | R3 | Claude の `/api/oauth/usage` は非公開 | 機能停止 | `ErrSchema` 検出。Codex と違いここだけは公開 IF が無い |
 | R4 | Claude の credentials.json 読み取りが CLI と競合 | CLI 側のログイン破壊 | **読み取り専用に徹する**（§6.3）。既定は setup-token 経路 |
 | R5 | app-server の複数アカウント API が未接続 | 複数アカウントが煩雑 | `CODEX_HOME` を分ける方式で回避。将来 API が通れば単一プロセス化する |
