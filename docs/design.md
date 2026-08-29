@@ -3,12 +3,16 @@
 Claude（Anthropic サブスクリプション）と Codex（ChatGPT サブスクリプション）の
 利用枠残量をリアルタイムに可視化するデスクトップアプリの詳細設計。
 
-- ステータス: Draft v2
+- ステータス: Draft v3
 - 対象読者: 実装者
 - 最終更新: 2026-08-29
 
-> **v2 での変更**: 両プロバイダの残量取得手段・OAuth 定数を実物のソース／バイナリから確定させた（§6, §18）。
-> v1 で「要検証」としていた項目、および「Codex は残量取得のたびに枠を消費しうる」という前提は解消された。
+> **v3 での変更（重要）**: 公式クライアントの OAuth client_id を流用する方式を**取りやめた**。
+> 第三者アプリがそれを使うことは公式に認められておらず、クライアントなりすましに当たるため（§2）。
+> 代わりに、Codex は公式に提供される `codex app-server` の JSON-RPC を、
+> Claude は公式 CLI が管理するクレデンシャルを使う方式に変更した（§7）。
+>
+> v2 での変更: 両プロバイダの残量取得手段を実物から確定させた。
 
 ---
 
@@ -28,7 +32,6 @@ Claude（Anthropic サブスクリプション）と Codex（ChatGPT サブス�
 | 5時間枠 | 消費率(%) と 次回リセット日時 |
 | 週間枠 | 消費率(%) と 次回リセット日時 |
 
-両プロバイダともこの 2 枠に対応する値を返す（§6）。
 これ以外の枠（Claude の Opus 専用週間枠、Codex の追加レート制限、クレジット残高など）は
 取得はするが、既定では折りたたみ、詳細表示でのみ出す。
 
@@ -37,7 +40,7 @@ Claude（Anthropic サブスクリプション）と Codex（ChatGPT サブス�
 | フェーズ | 対象 | 本設計での扱い |
 |---|---|---|
 | P1 | サーバ（ローカル常駐デーモン） | 詳細設計 |
-| P1 | OAuth ログイン用 Web 画面 | 詳細設計 |
+| P1 | ログイン用 Web 画面 | 詳細設計 |
 | P1 | 残量表示 Web UI | 詳細設計 |
 | P2 | 各 OS のメニューバー常駐クライアント | API 契約のみ確定、実装は後続 |
 
@@ -45,30 +48,68 @@ Claude（Anthropic サブスクリプション）と Codex（ChatGPT サブス�
 
 - 課金額・トークン単価の集計（API 従量課金は扱わない。サブスク枠のみ）
 - マルチユーザ / チーム共有。**単一ユーザのローカル実行専用**
-- クラウドホスティング（クレデンシャルをローカルに置く前提を崩さない）
+- クラウドホスティング
 
 ### 1.5 設計原則
 
-1. **ローカル完結**: サーバは `127.0.0.1` にのみバインドし、クレデンシャルは端末外に出さない。
-2. **プロバイダ非依存のコア**: コアは正規化済みモデルだけを扱い、差異は Adapter に閉じ込める。
-3. **控えめなポーリング**: 非公開エンドポイントに依存するため、リクエスト量は最小に抑える。
-4. **UI は API のクライアントに過ぎない**: Web UI とメニューバーアプリは同じ REST/SSE を使う。
+1. **公式インタフェースのみを使う**。公式クライアントの識別子を騙らない（§2）。
+2. **ローカル完結**: サーバは `127.0.0.1` にのみバインドし、クレデンシャルは端末外に出さない。
+3. **プロバイダ非依存のコア**: コアは正規化済みモデルだけを扱い、差異は Adapter に閉じ込める。
+4. **控えめな取得**: push があるものは push で受け、無いものだけ控えめにポーリングする。
+5. **UI は API のクライアントに過ぎない**: Web UI とメニューバーアプリは同じ REST/SSE を使う。
 
 ---
 
-## 2. 用語
+## 2. 前提となる制約: 公式クライアント識別子は流用しない
+
+本設計で最も強い制約であり、アーキテクチャの形を決めているため最初に置く。
+
+### 2.1 判断
+
+**Codex / Claude の OAuth `client_id` を本アプリが名乗ることはしない。**
+
+一時期の検討案では、公開ソースやバイナリから読み取れる `client_id`
+（Codex: `app_EMoamEEZ73f0CkXaXp7hrann`、Claude: `9d1c250a-…`）を使って
+本アプリ自身が OAuth ログイン画面を持つ構成を検討した。これは採用しない。
+
+### 2.2 理由
+
+| # | 根拠 |
+|---|---|
+| 1 | **Apache-2.0 はコードのライセンスであって、サービス利用の許諾ではない。** `openai/codex` の LICENSE / NOTICE が与えるのは著作権・特許の実施権であり、OpenAI のバックエンドへのアクセス権や OAuth クライアント登録の利用許諾は含まない。同ライセンス §6 は商標権を明示的に除外しており、「登録済みクライアントとして名乗る」行為はコードの利用より商標的な識別子の借用に近い |
+| 2 | **Codex 自身が first-party クライアントを区別している。** `is_first_party_originator()` は `codex_cli_rs` / `codex-tui` / `codex_vscode` / `Codex *` のみを first-party と判定する（§18-C10）。`originator` は authorize URL のクエリにもリクエストヘッダにも乗るため、第三者アプリがこれらを送ることは「自分は OpenAI 純正クライアントである」と申告することになる |
+| 3 | **第三者が自前の client_id を登録する公開制度が見当たらない。** ChatGPT / Claude のサブスクリプションアカウントに対する third-party OAuth 登録の公開窓口は確認できなかった |
+| 4 | **残量エンドポイントはいずれも文書化されていない内部 API である。** `/backend-api/wham/usage`、`/api/oauth/usage` とも公開ドキュメントが存在しない |
+
+Claude 側は CLI のソースが非公開であり、根拠はさらに薄い。
+
+### 2.3 帰結
+
+- Codex: **公式に提供される `codex app-server` の JSON-RPC を使う**（§6.2）。
+  ログインも残量取得もこの経路で完結し、なりすましは発生しない。
+- Claude: **公式 CLI が管理するクレデンシャルを使う**（§6.3）。
+  本アプリは OAuth フローを実装しない。
+- **両プロバイダとも、公式 CLI がインストール済みであることを前提にする。**
+  これは当初要件（アプリ自身が OAuth ログイン画面を持つ）からの後退だが、
+  §2.2 を踏まえると受け入れるべき制約である。
+  なお Codex についてはログインの起点となる Web 画面は維持できる（§8.1）。
+
+---
+
+## 3. 用語
 
 | 用語 | 定義 |
 |---|---|
 | Provider | `claude` / `codex` のいずれか |
-| Account | Provider に紐づく 1 つのログイン済みアカウント。同一 Provider で複数可 |
+| Account | Provider に紐づく 1 つのログイン済みアカウント |
 | Window | リセット周期を持つ利用枠。本アプリでは主に 5時間枠 と 週間枠 |
 | Snapshot | ある時刻に取得した Account の全 Window の状態 |
-| Adapter | Provider 固有の OAuth と残量取得を実装するモジュール |
+| Adapter | Provider 固有の取得手段を実装するモジュール |
+| app-server | `codex app-server` が提供する stdio JSON-RPC サーバ |
 
 ---
 
-## 3. 全体アーキテクチャ
+## 4. 全体アーキテクチャ
 
 ```mermaid
 flowchart LR
@@ -76,172 +117,65 @@ flowchart LR
     subgraph Server["llm-limits サーバ (127.0.0.1:7893)"]
       API["HTTP API 層<br/>REST + SSE"]
       Core["コア<br/>Scheduler / Normalizer"]
-      Store["Store<br/>SQLite + Keychain"]
+      Store["Store<br/>SQLite"]
       AD1["Adapter: claude"]
       AD2["Adapter: codex"]
     end
-    WebUI["Web UI<br/>ブラウザ"]
-    Tray["メニューバー常駐<br/>(P2)"]
+    WebUI["Web UI"]
+    Tray["メニューバー常駐 (P2)"]
+    CX["codex app-server<br/>(子プロセス)"]
+    CRED["~/.claude/.credentials.json<br/>(claude CLI が管理)"]
   end
 
-  Anth["api.anthropic.com<br/>platform.claude.com"]
-  OAI["chatgpt.com<br/>auth.openai.com"]
+  Anth["api.anthropic.com"]
+  OAI["chatgpt.com"]
 
   WebUI -->|REST/SSE| API
   Tray -.->|REST/SSE| API
-  API --> Core
-  Core --> Store
-  Core --> AD1 --> Anth
-  Core --> AD2 --> OAI
+  API --> Core --> Store
+  Core --> AD1 --> CRED
+  AD1 -->|GET /api/oauth/usage| Anth
+  Core --> AD2 -->|stdio JSON-RPC| CX
+  CX --> OAI
 ```
 
-### 3.1 プロセス構成
+**Codex の残量取得は app-server が肩代わりする**ため、本アプリから
+`chatgpt.com` への直接通信は発生しない。Claude のみ自前で HTTP を叩く。
 
-単一プロセス・単一バイナリ。内部は以下の goroutine で構成する。
+### 4.1 プロセス構成
 
-| goroutine | 役割 |
+| プロセス / goroutine | 役割 |
 |---|---|
 | `http` | API + Web UI の待受（固定ポート 7893） |
-| `oauth-cb` | Codex ログイン中のみ一時起動するコールバック待受（ポート 1455、§8.2） |
-| `scheduler` | アカウントごとのポーリングをスケジュール |
-| `worker`（アカウント数分） | 取得実行、トークン更新、結果の書き込み |
+| `codex app-server`（アカウント数分の**子プロセス**） | Codex のログイン・残量取得 |
+| `scheduler` | Claude アカウントのポーリング |
 | `broker` | Snapshot 更新を SSE 購読者へファンアウト |
 
 ---
 
-## 4. 技術選定
+## 5. 技術選定
 
-### 4.1 サーバ: Go
+### 5.1 サーバ: Go
 
-- cgo なしでクロスコンパイル可能 → macOS(arm64/amd64) / Windows / Linux 向けに単一バイナリを配布できる
-- 常駐時のメモリフットプリントが小さい（想定 20-30MB）
-- OS キーチェーン抽象（`github.com/zalando/go-keyring`）が 3 OS 揃っている
+- cgo なしでクロスコンパイル可能 → 3 OS 向けに単一バイナリを配布できる
+- 常駐時のメモリフットプリントが小さい
+- **子プロセスの stdio JSON-RPC 管理**（app-server 駆動に必須）が標準ライブラリで完結する
 
 | 用途 | ライブラリ |
 |---|---|
-| HTTP | 標準 `net/http`（Go 1.22 の `ServeMux` パターン） |
+| HTTP | 標準 `net/http` |
 | DB | `modernc.org/sqlite`（pure Go / cgo 不要） |
-| キーチェーン | `github.com/zalando/go-keyring` |
 | ログ | 標準 `log/slog` |
 
-**検討した代替**: Node/TypeScript。メニューバーを Electron にする場合に言語が揃うが、
-常駐プロセスとしてのメモリ（Electron は 150MB+）と配布の重さで不採用。
+キーチェーンライブラリは **不要になった**（本アプリはトークンを保存しないため。§7）。
 
-### 4.2 Web UI: フレームワークなしの素の TS + Vite
+### 5.2 Web UI: 素の TS + Vite
 
-画面数が 2 つ、状態も Snapshot のリストのみのため React を入れる必然性がない。
-ビルド成果物は Go の `embed.FS` にバンドルし、サーバ単体で完結させる。
+画面数が 2 つ、状態も Snapshot のリストのみ。ビルド成果物は Go の `embed.FS` に載せる。
 
-### 4.3 メニューバー常駐（P2 の方針のみ）: Tauri v2
+### 5.3 メニューバー常駐（P2 の方針のみ）: Tauri v2
 
-Rust 側で `TrayIcon` を持ち、Web UI と同じ HTML 資産を再利用できる。
-**サーバとは REST/SSE のみで会話するため、P2 で Electron に翻意しても設計への影響はない。**
-
----
-
-## 5. データモデル
-
-### 5.1 正規化モデル
-
-**Provider 間の差異はここで吸収する。UI とネイティブクライアントはこの型しか知らない。**
-
-```go
-type Provider string   // "claude" | "codex"
-
-// 枠の種別。表示要件 (§1.2) に直結する。
-type WindowKind string
-const (
-    WindowFiveHour WindowKind = "five_hour" // 5時間枠
-    WindowWeekly   WindowKind = "weekly"    // 週間枠
-    WindowOther    WindowKind = "other"     // 上記以外（詳細表示のみ）
-)
-
-type Window struct {
-    Kind        WindowKind
-    Key         string     // Provider 固有の原キー（"seven_day_opus" 等）。Other の識別に使う
-    Label       string     // UI 表示用 "5時間枠" / "週間枠(Opus)"
-    UsedPercent float64    // 0.0 - 100.0 に正規化済み
-    ResetsAt    *time.Time // 次回リセット日時。取れない場合のみ nil
-    WindowMin   *int       // 枠の長さ（分）。Provider が返す場合のみ
-}
-
-type Account struct {
-    ID        string    // ULID
-    Provider  Provider
-    Label     string    // 表示名（既定はメールアドレス）。ユーザ編集可
-    Subject   string    // Provider 側のアカウント識別子（重複ログイン検出用）
-    Plan      string    // "max20x" / "pro" 等
-    Status    Status    // ok | needs_reauth | error | disabled
-    CreatedAt time.Time
-}
-
-type Snapshot struct {
-    AccountID string
-    FetchedAt time.Time
-    Windows   []Window
-    Stale     bool   // 直近の取得に失敗し、前回値を返している
-    Err       string // Stale 時の理由（UI 表示用、機微情報は含めない）
-}
-```
-
-**設計判断: `Kind` による分類を Adapter の責務にする。**
-Codex は枠の長さをサーバから受け取る方式（`limit_window_seconds`）で、
-「primary が必ず 5 時間」とは限らない（Codex CLI 自身も長さから
-ラベルを導出している。§18-C4）。したがってキー名ではなく**枠の長さで分類**する。
-
-```go
-// 枠の長さから Kind を決める。Codex CLI と同じ ±5% の許容幅を使う。
-func classifyByLength(minutes int64) WindowKind {
-    switch {
-    case approx(minutes, 5*60):    return WindowFiveHour
-    case approx(minutes, 7*24*60): return WindowWeekly
-    default:                       return WindowOther
-    }
-}
-func approx(m, expect int64) bool {
-    f, e := float64(m), float64(expect)
-    return f >= e*0.95 && f <= e*1.05
-}
-```
-
-Claude は枠の長さを返さないため、**キー名で分類**する（`five_hour` → FiveHour、
-`seven_day` → Weekly、それ以外 → Other）。分類ロジックが Provider ごとに違うことこそが
-Adapter に閉じ込めるべき差異であり、コアはこの結果だけを見る。
-
-### 5.2 永続化スキーマ（SQLite）
-
-DB ファイル: `<config_dir>/llm-limits/data.db`（パーミッション 0600）
-
-```sql
-CREATE TABLE accounts (
-    id          TEXT PRIMARY KEY,
-    provider    TEXT NOT NULL,
-    label       TEXT NOT NULL,
-    subject     TEXT NOT NULL,
-    plan        TEXT NOT NULL DEFAULT '',
-    status      TEXT NOT NULL DEFAULT 'ok',
-    created_at  INTEGER NOT NULL,
-    UNIQUE(provider, subject)
-);
-
--- 直近値。UI の初期表示とサーバ再起動時のコールドスタートに使う
-CREATE TABLE snapshots (
-    account_id  TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
-    fetched_at  INTEGER NOT NULL,
-    payload     TEXT NOT NULL   -- []Window の JSON
-);
-
--- 時系列（スパークライン用）。7日でローテート
-CREATE TABLE snapshot_history (
-    account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    fetched_at  INTEGER NOT NULL,
-    window_kind TEXT NOT NULL,
-    used_pct    REAL NOT NULL,
-    PRIMARY KEY (account_id, window_kind, fetched_at)
-);
-```
-
-**トークンは SQLite に入れない**（§7）。`accounts.id` をキーにキーチェーンを引く。
+サーバとは REST/SSE のみで会話するため、後で Electron に翻意しても設計への影響はない。
 
 ---
 
@@ -253,70 +187,156 @@ CREATE TABLE snapshot_history (
 type Adapter interface {
     Provider() Provider
 
-    // OAuth。フローの形が Provider 間で違う (§8) ため、開始と完了だけを共通化する
-    BeginLogin() (*LoginSession, error)              // 認可 URL と待受方法を返す
-    CompleteLogin(ctx, s *LoginSession, code string) (*TokenSet, *Identity, error)
-    Refresh(ctx context.Context, refreshToken string) (*TokenSet, error)
+    // アカウント検出。設定済みのものを列挙する（ログインは各 Provider の作法に従う）
+    Discover(ctx context.Context) ([]Account, error)
 
-    // 残量取得
-    Fetch(ctx context.Context, t *TokenSet) ([]Window, error)
+    // 残量取得。push 型の Adapter は Subscribe を実装し、Fetch はフォールバックになる
+    Fetch(ctx context.Context, a Account) ([]Window, error)
+    Subscribe(ctx context.Context, a Account, ch chan<- []Window) error // 非対応なら ErrNoPush
+
+    // ログイン導線。方式は Provider ごとに異なる (§8)
+    BeginLogin(ctx context.Context) (*LoginHandle, error)
 
     MinInterval() time.Duration
 }
-
-type TokenSet struct {
-    AccessToken  string
-    RefreshToken string
-    ExpiresAt    time.Time
-    Extra        map[string]string // codex: chatgpt_account_id 等
-}
 ```
 
-`Fetch` のエラー分類と Scheduler の挙動:
+エラー分類:
 
-| エラー種別 | Scheduler の動作 |
-|---|---|
-| `ErrUnauthorized` | 1 度だけ Refresh してリトライ。失敗なら `needs_reauth` に遷移し停止 |
-| `ErrRateLimited`（429） | `Retry-After` を尊重。無ければ指数バックオフ |
-| `ErrTransient`（5xx/ネットワーク） | 指数バックオフ、前回値を `Stale=true` で維持 |
-| `ErrSchema` | 長い間隔でリトライ。**仕様変更の検出点**（§13.2） |
+| 種別 | 意味 | 動作 |
+|---|---|---|
+| `ErrNotInstalled` | 公式 CLI が見つからない | UI に導入手順を表示。ポーリングしない |
+| `ErrNeedsLogin` | CLI 側で未ログイン | UI にログイン導線を表示 |
+| `ErrTransient` | ネットワーク・一時障害 | 指数バックオフ、前回値を `Stale=true` で維持 |
+| `ErrSchema` | 応答の形が想定と違う | 長い間隔でリトライ。**仕様変更の検出点** |
 
 ---
 
-### 6.2 Claude Adapter
+### 6.2 Codex Adapter — `codex app-server` 駆動
 
-出典: Claude Code CLI バイナリ（`/opt/claude-code/bin/claude`）内の定数。詳細は §18-A。
+出典: `openai/codex`（Apache-2.0）commit `6478a75`。詳細は §18-C。
 
-#### OAuth
+#### 起動と接続
 
-| 項目 | 値 |
+```
+codex app-server        # 環境変数 CODEX_HOME でアカウントを切り替える
+```
+
+stdio 上の JSON-RPC で会話する。`initialize` でハンドシェイクした後、
+以下のメソッド・通知を使う。**いずれも公式 SDK（`sdk/python` の生成コード）に
+型付きで含まれる公開インタフェースであり、内部 API ではない。**
+
+| 方向 | メソッド / 通知 | 用途 |
+|---|---|---|
+| →  | `initialize` | ハンドシェイク |
+| →  | `account/read` | ログイン中のアカウント情報 |
+| →  | `account/login/start` | ログイン開始。`authUrl` を得る（§8.1） |
+| →  | `account/login/cancel` | ログイン中断 |
+| →  | `account/rateLimits/read` | **残量の取得** |
+| ←  | `account/rateLimits/updated` | **残量更新の push 通知** |
+| ←  | `account/updated` | アカウント状態の変化 |
+
+#### `account/rateLimits/read` のレスポンス
+
+```jsonc
+{
+  "rateLimits": {                       // 既定バケット
+    "limitId": "codex",
+    "limitName": null,
+    "primary":   { "usedPercent": 12, "windowDurationMins": 300,   "resetsAt": 1786000000 },
+    "secondary": { "usedPercent": 27, "windowDurationMins": 10080, "resetsAt": 1786400000 },
+    "credits": { "hasCredits": true, "unlimited": false, "balance": "12.50" },
+    "planType": "pro"
+  },
+  "rateLimitsByLimitId": { "codex": { ... }, "codex_other": { ... } },
+  "rateLimitResetCredits": { "availableCount": 0, "credits": [] }
+}
+```
+
+**正規化時の注意 3 点**
+
+1. JSON は **camelCase**（Rust 側の `#[serde(rename_all = "camelCase")]` による）。
+2. `usedPercent` は **すでに 0–100 の整数**。Claude と違い ×100 しない。
+3. `resetsAt` は **Unix エポック秒**。
+4. `Kind` は **`windowDurationMins` から判定**する（§9.1）。
+   `primary` = 5時間、`secondary` = 週間 という対応は**保証されていない**
+   （Codex CLI 自身も窓の長さからラベルを導出している。§18-C4）。
+
+`rateLimitsByLimitId` の既定以外のバケットと `credits` は `other` として取り込み、
+詳細表示でのみ出す。
+
+#### push の扱い
+
+`account/rateLimits/updated` 通知を受けたら、その内容をそのまま Snapshot に反映する。
+**Codex については定期ポーリングを行わない。**
+起動時と、通知が 30 分途絶えた場合の保険としてのみ `account/rateLimits/read` を呼ぶ。
+
+#### プロセス管理
+
+| 事象 | 動作 |
 |---|---|
-| client_id | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
-| 認可 URL（サブスク） | `https://claude.com/cai/oauth/authorize` |
-| 認可 URL（Console） | `https://platform.claude.com/oauth/authorize` |
-| トークン URL | `https://platform.claude.com/v1/oauth/token` |
-| redirect_uri | `https://platform.claude.com/oauth/code/callback` |
-| scope | `user:profile user:inference`（他に `org:create_api_key` 等） |
-| PKCE | S256 |
+| `codex` が PATH にない | `ErrNotInstalled`。UI に導入手順を表示 |
+| 子プロセスが異常終了 | 指数バックオフ（1s → 60s 上限）で再起動。直近 Snapshot は `Stale=true` で維持 |
+| サーバ終了 | 全子プロセスに SIGTERM → 5 秒後に SIGKILL |
+| 複数アカウント | **`CODEX_HOME` を変えた app-server プロセスを account ごとに 1 つ**持つ |
 
-> **重要**: Claude 側にループバック（`http://localhost:PORT/...`）の redirect_uri は
-> 見つからなかった。CLI は **Anthropic ホストのコールバックページに認可コードを表示させ、
-> ユーザがそれを貼り付ける方式**を採る。本アプリも同じ方式にする（§8.3）。
-> ループバックを前提にした設計にはできない。
+> **複数アカウントについて**: app-server プロトコルに複数アカウントを
+> 1 プロセスで扱う API は現時点で通っていない（`AccountSessionsAdd` は型のみ存在し、
+> メソッドが未接続）。したがって `CODEX_HOME` を分ける方式を採る。
+> 既定アカウントは `CODEX_HOME` 未設定（`~/.codex`）の 1 つ。
+
+---
+
+### 6.3 Claude Adapter — 公式 CLI のクレデンシャルを使う
+
+出典: Claude Code CLI 実行バイナリ内の文字列。詳細は §18-A。
+
+Claude には app-server 相当の公開インタフェースが無い
+（`claude` の CLI サブコマンドに `usage` は存在せず、`/usage` は対話 TUI 専用）。
+そのため、**公式 CLI が取得・更新しているトークンを読んで使う**方式にする。
+本アプリは OAuth フローを実装せず、トークンのリフレッシュも行わない。
+
+#### トークンの入手経路（優先順）
+
+| 順位 | 経路 | 位置づけ |
+|---|---|---|
+| 1 | `claude setup-token` が発行する長期トークン | **公式に用意された、プログラム利用向けの手段**。UI で貼り付けてもらう |
+| 2 | 環境変数 `CLAUDE_CODE_OAUTH_TOKEN` | 同上を環境変数で渡す形 |
+| 3 | `$CLAUDE_CONFIG_DIR ?? ~/.claude` 配下の `.credentials.json` | CLI のログイン結果を読む |
+
+**1 を既定の案内とする。** ユーザが明示的にトークンを発行して本アプリに渡す形であり、
+意図が最もはっきりしているため。3 は「すでにログイン済みなら追加操作なしで動く」
+利便性のために用意するが、UI 上で「claude CLI のログイン情報を読みます」と明示して同意を取る。
+
+macOS では CLI が Keychain にクレデンシャルを置く場合がある。
+**Keychain 上のサービス名は実機で確認する必要がある（未確認）。**
+確認できるまで、macOS では経路 1 のみを提示する。
+
+#### トークンのリフレッシュを自前でしない
+
+`.credentials.json` を読む場合、期限切れトークンのリフレッシュは `claude` CLI に委ねる。
+本アプリは以下のように振る舞う。
+
+- ファイルの **mtime を監視**し、変化したら読み直す
+  （CLI 自身も同じ方法で更新を検知している。§18-A7）
+- 401 を受けたら「`claude` CLI を一度起動してログイン状態を更新してください」と UI に出す
+- **本アプリからトークンエンドポイントを叩かない**（リフレッシュトークンのローテーションを
+  CLI と奪い合うと、CLI 側のログインを壊しうるため）
+
+これは経路 1 のトークンには当てはまらない（長期トークンでリフレッシュが不要）。
+**経路 1 を既定にする理由の一つがこれである。**
 
 #### 残量取得
 
 ```
-GET https://api.anthropic.com/api/oauth/usage
-GET https://api.anthropic.com/api/oauth/usage?at_wall=1&skip_spend=1   ← 軽量版
+GET https://api.anthropic.com/api/oauth/usage?at_wall=1&skip_spend=1
 
 Authorization: Bearer <access_token>
 anthropic-beta: oauth-2025-04-20
 Content-Type: application/json
 ```
 
-**読み取り専用であり、利用枠を消費しない。** タイムアウトは CLI 同様 5 秒。
-401 の場合はトークンをリフレッシュして 1 度だけ再試行する（CLI と同じ挙動）。
+読み取り専用で、利用枠を消費しない。タイムアウト 5 秒（CLI と同じ）。
 
 レスポンス（トップレベルに枠ごとのオブジェクト）:
 
@@ -333,11 +353,11 @@ Content-Type: application/json
 
 **正規化時の注意 2 点**
 
-1. `utilization` は **0.0–1.0 の小数**。`UsedPercent` へは **×100** する。
-   （CLI 内でも `used_percentage: utilization * 100` として換算している）
-2. `resets_at` は **Unix エポック秒**（ミリ秒ではない）。
+1. `utilization` は **0.0–1.0 の小数**。`UsedPercent` へは **×100** する
+   （CLI 内にも `used_percentage: utilization * 100` の換算がある）。
+2. `resets_at` は **Unix エポック秒**。
 
-マッピング:
+マッピング（Claude は窓の長さを返さないため**キー名で分類**する）:
 
 | API のキー | `Kind` | `Label` | 既定表示 |
 |---|---|---|---|
@@ -348,263 +368,219 @@ Content-Type: application/json
 | `seven_day_oauth_apps` | `other` | 週間枠(OAuth Apps) | 詳細のみ |
 | `overage` | `other` | 追加利用 | 詳細のみ |
 
-キーは将来増減しうるため、**未知のキーは `other` として取り込み、落とさない**。
+未知のキーは `other` として取り込み、落とさない。
 `five_hour` と `seven_day` の欠落のみ `ErrSchema` とする。
+
+#### ポーリング
+
+push が無いため定期ポーリングする。既定 60 秒（§9.2）。
 
 ---
 
-### 6.3 Codex Adapter
+### 6.4 依存する非公開インタフェースについて
 
-出典: `openai/codex` リポジトリ（公開・Apache-2.0）。詳細は §18-C。
+Codex 側は公開インタフェースだけで完結するが、
+**Claude 側の `/api/oauth/usage` は文書化されていない**。この一点は残る。
 
-#### OAuth
+- `ErrSchema` を明示的に検出・ログ化し、仕様変更に気づける状態を保つ（§14.2）
+- リクエスト量は公式クライアントの通常利用を上回らない水準に抑える（§9.2）
+- 自分のアカウントの状態を自分で読む用途に限定する
 
-| 項目 | 値 |
-|---|---|
-| issuer | `https://auth.openai.com` |
-| client_id | `app_EMoamEEZ73f0CkXaXp7hrann` |
-| 認可 URL | `https://auth.openai.com/oauth/authorize` |
-| トークン URL | `https://auth.openai.com/oauth/token` |
-| redirect_uri | `http://localhost:1455/auth/callback` |
-| scope | `openid profile email offline_access api.connectors.read api.connectors.invoke` |
-| PKCE | S256 |
-| 追加クエリ | `id_token_add_organizations=true`, `codex_cli_simplified_flow=true`, `originator`, `state` |
+---
 
-> **重要**: **ポート 1455 は固定**。クライアント登録側で redirect_uri が
-> このポートに固定されているため、任意ポートは使えない。§8.2 の設計はこれに従う。
+## 7. データモデルと保存
 
-リフレッシュは `POST https://auth.openai.com/oauth/token` に
-JSON `{"client_id":..., "grant_type":"refresh_token", "refresh_token":...}`。
-失敗時のエラーコード `refresh_token_expired` / `refresh_token_reused` /
-`refresh_token_invalidated` はいずれも再ログインが必要な状態として `needs_reauth` に落とす。
+### 7.1 正規化モデル
 
-`id_token` の `https://api.openai.com/auth` クレームから以下を取得する:
+```go
+type Provider string   // "claude" | "codex"
 
-- `chatgpt_account_id` → 後述のリクエストヘッダに必要。`Account.Subject` にも使う
-- `chatgpt_plan_type` → `Account.Plan`（`plus` / `pro` / `team` / `business` 等）
-- `chatgpt_account_is_fedramp` → true なら `X-OpenAI-Fedramp: true` を付与
+type WindowKind string
+const (
+    WindowFiveHour WindowKind = "five_hour"
+    WindowWeekly   WindowKind = "weekly"
+    WindowOther    WindowKind = "other"
+)
 
-#### 残量取得
+type Window struct {
+    Kind        WindowKind
+    Key         string     // Provider 固有の原キー（"seven_day_opus" 等）
+    Label       string     // "5時間枠" / "週間枠(Opus)"
+    UsedPercent float64    // 0.0 - 100.0 に正規化済み
+    ResetsAt    *time.Time // 次回リセット日時
+    WindowMin   *int       // 枠の長さ（分）。Provider が返す場合のみ
+}
 
-**専用の読み取り専用エンドポイントが存在する。**
+type Account struct {
+    ID        string   // ULID
+    Provider  Provider
+    Label     string   // 表示名（既定はメールアドレス）
+    Subject   string   // Provider 側の識別子
+    Plan      string   // "max20x" / "pro" 等
+    Status    Status   // ok | needs_login | not_installed | error | disabled
+    CodexHome string   // codex のみ。CODEX_HOME のパス
+}
 
-```
-GET https://chatgpt.com/backend-api/wham/usage
-
-Authorization: Bearer <access_token>
-ChatGPT-Account-Id: <chatgpt_account_id>
-User-Agent: <任意>
-```
-
-**このエンドポイントは利用枠を消費しない。** v1 で懸念していた
-「残量を知るために推論リクエストを投げる必要がある」という問題は存在しない。
-
-レスポンス:
-
-```json
-{
-  "plan_type": "pro",
-  "rate_limit": {
-    "allowed": true,
-    "limit_reached": false,
-    "primary_window":   { "used_percent": 12, "limit_window_seconds": 18000,
-                          "reset_after_seconds": 9000, "reset_at": 1786000000 },
-    "secondary_window": { "used_percent": 27, "limit_window_seconds": 604800,
-                          "reset_after_seconds": 300000, "reset_at": 1786400000 }
-  },
-  "credits": { "has_credits": true, "unlimited": false, "balance": "12.50" },
-  "additional_rate_limits": [ ... ],
-  "rate_limit_reached_type": null
+type Snapshot struct {
+    AccountID string
+    FetchedAt time.Time
+    Windows   []Window
+    Stale     bool
+    Err       string
 }
 ```
 
-**正規化時の注意 3 点**
+### 7.2 本アプリはトークンを保存しない
 
-1. `used_percent` は **すでに 0–100 の整数**。Claude と違い ×100 しない。
-2. `reset_at` は **Unix エポック秒**。`reset_after_seconds` も併記されるが、
-   端末時計のずれに影響されない `reset_at` を採用する。
-3. `Kind` は **`limit_window_seconds` から判定**する（§5.1 の `classifyByLength`）。
-   `primary` = 5時間、`secondary` = 週間 という対応は**保証されていない**。
-   18000 秒 → 5時間枠、604800 秒 → 週間枠。
+**v2 からの最大の変更点。** OAuth を自前で実装しなくなったため、
+アクセストークン・リフレッシュトークンを本アプリが永続化する必要がなくなった。
 
-`additional_rate_limits` と `credits` は `other` として取り込み、詳細表示でのみ出す。
+| Provider | トークンの所在 | 本アプリの扱い |
+|---|---|---|
+| Codex | `$CODEX_HOME/auth.json`（codex CLI が管理） | **触らない。** app-server 越しに結果だけ受け取る |
+| Claude 経路1 | ユーザが貼り付けた長期トークン | OS キーチェーンに保存（`go-keyring`） |
+| Claude 経路3 | `~/.claude/.credentials.json`（claude CLI が管理） | **読むだけ。書き込まない** |
 
-#### フォールバック経路（実装しないが把握しておく）
+キーチェーンを使うのは Claude の経路 1 のみ。
+これによりキーチェーン非対応環境向けの暗号化ファイル実装（v2 の §7.1）は不要になった
+（その環境では経路 3 か環境変数を使う）。
 
-`/wham/usage` が使えなくなった場合、同じ値は推論レスポンスからも得られる。
+### 7.3 永続化スキーマ（SQLite）
 
-- **レスポンスヘッダ**: `x-codex-primary-used-percent`（小数可）,
-  `x-codex-primary-window-minutes`, `x-codex-primary-reset-at`（エポック秒）と
-  `x-codex-secondary-*` の同型。`x-{limit_id}-primary-*` で複数の枠系統が並ぶ。
-- **SSE イベント**: `type: "codex.rate_limits"` のイベントに
-  `rate_limits.primary.{used_percent, window_minutes, reset_at}` が入る。
+`<config_dir>/llm-limits/data.db`（0600）
 
-この経路はリクエストを伴うため枠を消費する。**採用しない**が、
-`/wham/usage` が 404 を返し始めたときの移行先として記録しておく。
+```sql
+CREATE TABLE accounts (
+    id          TEXT PRIMARY KEY,
+    provider    TEXT NOT NULL,
+    label       TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    plan        TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'ok',
+    codex_home  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    UNIQUE(provider, subject)
+);
 
----
+CREATE TABLE snapshots (
+    account_id  TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    fetched_at  INTEGER NOT NULL,
+    payload     TEXT NOT NULL   -- []Window の JSON
+);
 
-### 6.4 非公開エンドポイント依存に関する注意
-
-両 Provider とも、残量取得に公開ドキュメントのある API は存在しない。
-Codex 側は Apache-2.0 のソースから確定できたが、Claude 側は配布バイナリ内の
-文字列から確認したものであり、いずれも**予告なく変わりうる**。したがって:
-
-- スキーマ不一致（`ErrSchema`）を明示的に検出・ログ化し、仕様変更に気づける状態を保つ。
-- リクエスト量は公式クライアントの通常利用を上回らない水準に抑える（§9）。
-- 自分のアカウントの状態を自分で読む用途に限定する。第三者アカウントの取得や
-  取得結果の再配布は行わない。
-
----
-
-## 7. クレデンシャル保存
-
-### 7.1 保存先の優先順位
-
-| 順位 | 保存先 | 対象 OS | 実現方法 |
-|---|---|---|---|
-| 1 | OS キーチェーン | macOS Keychain / Windows Credential Manager / Linux Secret Service | `go-keyring` |
-| 2 | 暗号化ファイル | 上記が使えない環境（ヘッドレス Linux 等） | AES-256-GCM |
-
-- キーチェーン: service = `llm-limits`, user = `<account_id>`, secret = `TokenSet` の JSON
-- フォールバック: `<config_dir>/llm-limits/credentials.enc`（0600）、
-  鍵は `<config_dir>/llm-limits/master.key`（0600, 32 バイト乱数）
-
-**フォールバックの限界を明記する**: 鍵が同一ユーザのファイルシステム上にあるため、
-これは「同一ユーザ権限で動くプロセス」からの保護にはならない。
-保護対象は「設定ディレクトリごとバックアップ／同期してしまった際の平文流出」である。
-このモードであることを起動時に警告ログへ出し、UI にもバッジで表示する。
-
-### 7.2 トークンのライフサイクル
-
-```mermaid
-sequenceDiagram
-  participant W as Worker
-  participant S as TokenStore
-  participant P as Provider
-
-  W->>S: Get(accountID)
-  alt 有効期限まで 5 分以上
-    S-->>W: TokenSet
-  else 期限切れ間近
-    S->>P: refresh_token でリフレッシュ
-    alt 成功
-      P-->>S: 新 TokenSet
-      S->>S: keychain へ上書き保存
-      S-->>W: 新 TokenSet
-    else 失敗 (invalid_grant / refresh_token_expired 等)
-      S->>S: account.status = needs_reauth
-      S-->>W: ErrUnauthorized
-    end
-  end
+CREATE TABLE snapshot_history (
+    account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    fetched_at  INTEGER NOT NULL,
+    window_kind TEXT NOT NULL,
+    used_pct    REAL NOT NULL,
+    PRIMARY KEY (account_id, window_kind, fetched_at)
+);
 ```
 
-- リフレッシュは **singleflight** で同一アカウントの同時実行を 1 本に潰す。
-- リフレッシュ成功時は旧 refresh_token を即座に破棄（ローテーションに対応）。
-- **保存の失敗はリフレッシュ全体の失敗として扱う**。
-  新トークンを保持したまま保存に失敗すると、再起動で復旧不能になるため。
+### 7.4 ログ
 
-### 7.3 ログとエラー出力
-
-トークン・認可コード・`code_verifier` はログに出さない。
-`slog.Handler` にマスキングフィルタを噛ませ、キー名に
-`token` / `secret` / `authorization` / `code` を含む値を一律 `***` にする。
-URL をログに出す場合はクエリの `code` / `redirect_uri` も同様に伏せる。
+トークンはログに出さない。`slog.Handler` にマスキングフィルタを噛ませ、
+キー名に `token` / `secret` / `authorization` を含む値を一律 `***` にする。
+**app-server との JSON-RPC を debug ログに落とす際も同じフィルタを通す**
+（`account/login/start` の応答や `account/read` にアカウント情報が含まれるため）。
 
 ---
 
-## 8. ログインフロー
+## 8. ログイン導線
 
-**Provider ごとにフローの形が異なる**（Claude はコード貼り付け、Codex はループバック）。
-この差異は Adapter の `BeginLogin` / `CompleteLogin` に閉じ込め、
-UI からは「認可 URL を開く → 完了する」という同じ 2 ステップに見せる。
+自前の OAuth を実装しないため、Provider ごとに導線が異なる。
+UI は「アカウントを追加」から始まる 1 つの流れに見せる。
 
-### 8.1 共通部分
+### 8.1 Codex: app-server 経由（Web 画面から開始できる）
 
-- `state` は 32 バイト乱数の base64url。サーバのメモリ上に
-  `state → {provider, verifier, expiresAt(10分)}` で保持する。
-  DB には書かない（プロセス再起動時はログインをやり直させる方が安全）。
-- PKCE は両者とも S256。
-- 同一 `(provider, subject)` で再ログインした場合は新規追加ではなく
-  **トークンの更新**として扱い、`needs_reauth` を解除する。これが再認証の導線を兼ねる。
-
-### 8.2 Codex: ループバック方式（ポート 1455 固定）
+**当初要件「Web 画面から OAuth ログイン」は Codex については維持できる。**
+本アプリは認可 URL を自分で組み立てず、app-server から受け取るだけ。
+コールバックの待受（ポート 1455）も app-server 側が行う。
 
 ```mermaid
 sequenceDiagram
   actor U as ユーザ
   participant UI as Web UI
-  participant S as サーバ(7893)
-  participant CB as 一時待受(1455)
-  participant P as auth.openai.com
+  participant S as llm-limits サーバ
+  participant AS as codex app-server
+  participant P as OpenAI
 
-  U->>UI: 「Codex を追加」クリック
+  U->>UI: 「Codex アカウントを追加」
   UI->>S: POST /api/v1/accounts/codex/login
-  S->>CB: :1455 を bind（10分でタイムアウト）
-  alt bind 失敗（Codex CLI がログイン中など）
-    S-->>UI: 409 port_in_use
-    UI->>U: 「ポート1455が使用中です」と表示
-  else
-    S-->>UI: { authorize_url }
-    UI->>U: 別タブで authorize_url を開く
-    U->>P: ログイン・認可
-    P-->>CB: GET /auth/callback?code=..&state=..
-    CB->>S: state 照合 → トークン交換 → アカウント登録
-    CB-->>U: 完了画面
-    S->>CB: 待受を停止
-    S--)UI: SSE で account イベント
-  end
-```
-
-**ポート 1455 を常時占有しない**のが要点。Codex CLI 自身が同じポートを使うため、
-ログイン中の 10 分間だけ bind し、完了・中断・タイムアウトのいずれでも即座に解放する。
-
-### 8.3 Claude: 認可コード貼り付け方式
-
-Claude の redirect_uri は Anthropic ホストのページ（`https://platform.claude.com/oauth/code/callback`）で、
-ループバックは使えない。そのため以下の流れになる。
-
-```mermaid
-sequenceDiagram
-  actor U as ユーザ
-  participant UI as Web UI
-  participant S as サーバ(7893)
-  participant P as claude.com
-
-  U->>UI: 「Claude を追加」クリック
-  UI->>S: POST /api/v1/accounts/claude/login
-  S-->>UI: { authorize_url, mode: "paste_code", session_id }
-  UI->>U: 別タブで authorize_url を開く + コード入力欄を表示
+  S->>AS: account/login/start {"type":"chatgpt"}
+  AS-->>S: { loginId, authUrl }
+  S-->>UI: { login_id, authorize_url, mode:"open_url" }
+  UI->>U: 別タブで authorize_url を開く
   U->>P: ログイン・認可
-  P-->>U: コールバックページに認可コードを表示
-  U->>UI: コードを貼り付け
-  UI->>S: POST /api/v1/accounts/claude/login/{session_id}/code
-  S->>P: code + code_verifier をトークン交換
-  P-->>S: TokenSet
-  S->>S: アカウント登録 → キーチェーン保存 → 即時 Fetch
-  S-->>UI: { account }
+  P-->>AS: コールバック（app-server が待受）
+  AS--)S: account/updated 通知
+  S->>AS: account/rateLimits/read
+  S--)UI: SSE で account / snapshot
 ```
 
-**UI 上の配慮**: 認可 URL を開くボタンと入力欄を同一画面に並べ、
-「別タブで承認 → 表示されたコードをここに貼る」という手順を明示する。
-コードは `state` を含む形式で返ることがあるため、
-サーバ側で `code#state` 形式・前後の空白・改行を許容してパースする。
+中断は `account/login/cancel { loginId }`。
+**ポート 1455 の bind は app-server の責務**なので、本アプリは関与しない
+（v2 で設計した一時待受は不要になった）。
 
-`state` 照合はこの方式でも必ず行う（貼り付けられた値に含まれる state と保持中の state を比較）。
+### 8.2 Claude: トークン貼り付け、または既存ログインの読み取り
+
+```
+┌────────────────────────────────────────────────┐
+│ Claude アカウントを追加                         │
+├────────────────────────────────────────────────┤
+│ ○ 長期トークンを使う（推奨）                     │
+│   ターミナルで次を実行し、表示された値を貼り付け： │
+│     $ claude setup-token                        │
+│   [                                        ]    │
+│                                                 │
+│ ○ ログイン済みの claude CLI の情報を使う          │
+│   ~/.claude/.credentials.json を読み取ります。   │
+│   ✓ 検出済み（work@example.com）                 │
+│                                                 │
+│                          [ キャンセル ] [ 追加 ] │
+└────────────────────────────────────────────────┘
+```
+
+- 既定は上の「長期トークン」。ユーザの意図が明示的で、リフレッシュ競合も起きないため。
+- 下の選択肢は検出できた場合のみ有効化し、**何を読むかをパスまで明示する**。
+- どちらも選べない場合（CLI 未導入）は `ErrNotInstalled` として導入手順を出す。
 
 ---
 
-## 9. ポーリング設計
+## 9. 取得タイミングの設計
 
-**両 Provider とも読み取り専用エンドポイントで枠を消費しない**ため、
-v1 で設けた Provider ごとの間隔差は不要になった。既定は両者とも 60 秒。
+### 9.1 Window の分類
 
-### 9.1 スケジューリング
+```go
+// 枠の長さから Kind を決める。Codex CLI と同じ ±5% の許容幅を使う。
+func classifyByLength(minutes int64) WindowKind {
+    switch {
+    case approx(minutes, 5*60):    return WindowFiveHour
+    case approx(minutes, 7*24*60): return WindowWeekly
+    default:                       return WindowOther
+    }
+}
+func approx(m, expect int64) bool {
+    f, e := float64(m), float64(expect)
+    return f >= e*0.95 && f <= e*1.05
+}
+```
 
-アカウントごとに独立したタイマーを持つ。
+Codex は `windowDurationMins` でこれを使い、Claude はキー名で分類する（§6.3）。
+分類ロジックが Provider ごとに違うことこそ Adapter に閉じ込めるべき差異であり、
+コアはこの結果だけを見る。
+
+### 9.2 スケジューリング
+
+| Provider | 方式 | 間隔 |
+|---|---|---|
+| Codex | **push**（`account/rateLimits/updated`） | 定期取得なし。起動時 + 通知が30分途絶えたときの保険のみ |
+| Claude | ポーリング | 既定 60 秒 |
+
+Claude のポーリングは次のように調整する。
 
 ```
-interval = max(adapter.MinInterval(), userConfiguredInterval)   // 既定 60s
+interval = max(60s, userConfiguredInterval)
 
 // リセット直後の値を早く取りたいので、リセット時刻をまたぐ場合は寄せる
 if 0 < timeUntilNearestReset < interval {
@@ -612,26 +588,25 @@ if 0 < timeUntilNearestReset < interval {
 } else {
     next = now + interval
 }
-
-if backoff.active { next = backoff.nextAt }   // バックオフ中は上書き
+if backoff.active { next = backoff.nextAt }
 next += jitter(±10%)
 ```
 
 **UI 非表示時の抑制**: SSE の購読者が 0 かつ最終アクセスから 10 分経過している場合、
-間隔を 5 倍に伸ばす。購読が復活したら即座に 1 回 Fetch して通常間隔に戻す。
-誰も見ていない時間帯に非公開 API を叩き続けないため。
+間隔を 5 倍に伸ばす。購読が復活したら即座に 1 回取得して通常間隔に戻す。
 
-### 9.2 バックオフ
+### 9.3 バックオフ
 
 | 種別 | 間隔 |
 |---|---|
-| `ErrRateLimited` | `Retry-After` があればそれ。無ければ 5分 → 10分 → 20分 → 30分（上限） |
+| 429 | `Retry-After` があればそれ。無ければ 5分 → 10分 → 20分 → 30分（上限） |
 | `ErrTransient` | 1分 → 2分 → 4分 → … → 30分（上限）。成功でリセット |
 | `ErrSchema` | 30分固定。連続 3 回で `status=error`、UI に「取得方法の更新が必要」を表示 |
+| app-server 異常終了 | 1秒 → 2秒 → … → 60秒（上限） |
 
 すべて ±10% のジッタを付与する。
 
-### 9.3 失敗時の表示方針
+### 9.4 失敗時の表示方針
 
 取得に失敗しても直近の Snapshot を保持し、`Stale=true` と `FetchedAt` を返す。
 UI は値をグレーアウトし「最終取得: N 分前」を表示する。**値を消さない**
@@ -642,11 +617,11 @@ UI は値をグレーアウトし「最終取得: N 分前」を表示する。*
 ## 10. HTTP API 仕様
 
 - ベース URL: `http://127.0.0.1:7893`
-- 認証: `Authorization: Bearer <local_token>`（§12.2）
-- 表現: JSON。時刻は RFC3339（UTC）。
+- 認証: `Authorization: Bearer <local_token>`（§13.2）
+- 時刻は RFC3339（UTC）
 
 ```json
-{ "error": { "code": "needs_reauth", "message": "再ログインが必要です", "account_id": "01J..." } }
+{ "error": { "code": "needs_login", "message": "claude CLI でログインしてください", "account_id": "01J..." } }
 ```
 
 ### 10.1 エンドポイント一覧
@@ -654,34 +629,23 @@ UI は値をグレーアウトし「最終取得: N 分前」を表示する。*
 | Method | Path | 説明 |
 |---|---|---|
 | GET | `/api/v1/health` | 稼働確認。認証不要 |
+| GET | `/api/v1/providers` | 各 Provider の CLI 検出状況とバージョン |
 | GET | `/api/v1/accounts` | アカウント一覧 |
-| POST | `/api/v1/accounts/{provider}/login` | ログイン開始。`mode` で UI の分岐を指示 |
-| POST | `/api/v1/accounts/claude/login/{session}/code` | 貼り付けコードの投入（§8.3） |
-| DELETE | `/api/v1/accounts/{provider}/login/{session}` | ログイン中断（1455 の解放を含む） |
+| POST | `/api/v1/accounts/codex/login` | app-server 経由でログイン開始（§8.1） |
+| DELETE | `/api/v1/accounts/codex/login/{login_id}` | ログイン中断 |
+| POST | `/api/v1/accounts/claude` | トークン投入 or 既存クレデンシャル採用（§8.2） |
 | PATCH | `/api/v1/accounts/{id}` | `label` / `disabled` の更新 |
-| DELETE | `/api/v1/accounts/{id}` | 削除（キーチェーンのトークンも削除） |
+| DELETE | `/api/v1/accounts/{id}` | 本アプリの管理対象から外す（**CLI 側はログアウトさせない**） |
 | GET | `/api/v1/quotas` | 全アカウントの最新 Snapshot |
-| GET | `/api/v1/quotas/{id}/history?kind=five_hour&hours=24` | 時系列（スパークライン用） |
-| POST | `/api/v1/accounts/{id}/refresh` | 即時 Fetch（10秒に1回に制限） |
+| GET | `/api/v1/quotas/{id}/history?kind=five_hour&hours=24` | 時系列 |
+| POST | `/api/v1/accounts/{id}/refresh` | 即時取得（10秒に1回に制限） |
 | GET | `/api/v1/stream` | SSE |
-| GET / PUT | `/api/v1/config` | 設定の取得・更新 |
-| GET | `/oauth/callback/codex` | Codex コールバック（ポート 1455 側で待受） |
+| GET / PUT | `/api/v1/config` | 設定 |
 
-### 10.2 `POST /api/v1/accounts/{provider}/login` レスポンス
+`DELETE /accounts/{id}` が CLI 側のログアウトを行わないのは重要な点で、
+本アプリの都合で公式 CLI の状態を壊さないため。UI にもその旨を書く。
 
-```json
-// codex
-{ "session_id": "s_01J...", "authorize_url": "https://auth.openai.com/oauth/authorize?...",
-  "mode": "loopback", "expires_at": "2026-08-29T10:15:00Z" }
-
-// claude
-{ "session_id": "s_01J...", "authorize_url": "https://claude.com/cai/oauth/authorize?...",
-  "mode": "paste_code", "expires_at": "2026-08-29T10:15:00Z" }
-```
-
-UI は `mode` を見て、コード入力欄を出すかコールバック待ちにするかを決める。
-
-### 10.3 `GET /api/v1/quotas` レスポンス
+### 10.2 `GET /api/v1/quotas` レスポンス
 
 ```json
 {
@@ -696,9 +660,7 @@ UI は `mode` を見て、コード入力欄を出すかコールバック待ち
           { "kind": "five_hour", "key": "five_hour", "label": "5時間枠",
             "used_percent": 42.0, "resets_at": "2026-08-29T11:00:00Z" },
           { "kind": "weekly", "key": "seven_day", "label": "週間枠",
-            "used_percent": 61.5, "resets_at": "2026-09-02T00:00:00Z" },
-          { "kind": "other", "key": "seven_day_opus", "label": "週間枠(Opus)",
-            "used_percent": 10.0, "resets_at": "2026-09-02T00:00:00Z" }
+            "used_percent": 61.5, "resets_at": "2026-09-02T00:00:00Z" }
         ]
       }
     },
@@ -719,10 +681,9 @@ UI は `mode` を見て、コード入力欄を出すかコールバック待ち
 }
 ```
 
-クライアントは `kind` が `five_hour` / `weekly` のものを既定表示し、
-`other` は詳細表示に回す。**キー名ではなく `kind` で分岐する。**
+クライアントは `kind` で分岐する。**キー名で分岐してはならない。**
 
-### 10.4 SSE (`GET /api/v1/stream`)
+### 10.3 SSE (`GET /api/v1/stream`)
 
 ```
 event: snapshot
@@ -732,13 +693,12 @@ event: account
 data: {"action":"added","account":{...}}
 
 event: status
-data: {"account_id":"01J8ZQ...","status":"needs_reauth"}
+data: {"account_id":"01J8ZQ...","status":"needs_login"}
 
 : keepalive   ← 20 秒ごと
 ```
 
 接続時にまず全アカウントの `snapshot` を流す（初期同期）。
-これによりクライアントは `stream` だけで完結できる。
 切断時は指数バックオフ（1秒 → 30秒上限）で再接続する。
 
 ---
@@ -754,8 +714,6 @@ data: {"account_id":"01J8ZQ...","status":"needs_reauth"}
 
 ### 11.2 ダッシュボード
 
-表示要件（§1.2）そのままに、1 アカウント 2 行を基本とする。
-
 ```
 ┌────────────────────────────────────────────────────────┐
 │ llm-limits                          ⟳ 3秒前       ⚙   │
@@ -763,24 +721,24 @@ data: {"account_id":"01J8ZQ...","status":"needs_reauth"}
 │ ● Claude — work@example.com                    max20x  │
 │   5時間枠  ▓▓▓▓▓▓░░░░░░░░  42%   11:00 リセット (2時間後) │
 │   週間枠   ▓▓▓▓▓▓▓▓▓░░░░░  62%   9/2 09:00 (4日後)      │
-│   ▸ その他の枠 (3)                                      │
+│   ▸ その他の枠 (4)                                      │
 ├────────────────────────────────────────────────────────┤
 │ ● Codex — personal                                pro  │
 │   5時間枠  ▓▓░░░░░░░░░░░░  12%   13:30 リセット (4時間後) │
 │   週間枠   ▓▓▓▓░░░░░░░░░░  27%   9/2 09:00 (4日後)      │
 ├────────────────────────────────────────────────────────┤
-│ ⚠ Claude — old@example.com          再ログインが必要     │
+│ ⚠ Claude — old@example.com     claude CLI で要ログイン   │
 └────────────────────────────────────────────────────────┘
 ```
 
 - **リセット日時は絶対時刻を主、相対時間を従**として併記する。
   「2時間後」だけだと予定を立てにくく、絶対時刻だけだと直感が働かないため。
-  日付が今日ならば時刻のみ、翌日以降は日付を添える。
+  日付が今日なら時刻のみ、翌日以降は日付を添える。
 - 残量バーの色は 3 段階（`< 70%` 通常 / `70–90%` 注意 / `>= 90%` 警告）。
   **色だけに意味を持たせず**、数値とテキストラベルを併記する。
 - `stale` のカードは彩度を落とし「最終取得 N 分前」を明示する。
-- `needs_reauth` のカードは値を出さず、再ログインボタンのみを出す。
-- `kind: other` の枠は既定で折りたたむ（`▸ その他の枠 (3)`）。
+- `needs_login` / `not_installed` は値を出さず、対処導線のみを出す。
+- `kind: other` は既定で折りたたむ。
 
 ### 11.3 状態遷移（クライアント側）
 
@@ -799,10 +757,7 @@ stateDiagram-v2
 
 ### 11.4 メニューバー常駐クライアント（P2 の要件メモ）
 
-本設計では実装しないが、API を確定させるうえでの前提:
-
-- メニューバーには**最も逼迫している枠の使用率**を 1 つだけ数値表示する
-  （どの枠を出すかは設定で固定も可能）
+- メニューバーには**最も逼迫している枠の使用率**を 1 つだけ数値表示（設定で固定も可）
 - クリックでポップオーバー。中身はダッシュボードと同じ
 - 閾値（既定 90%）超過で 1 度だけ OS 通知。リセットで再武装
 - サーバプロセスは常駐アプリが子プロセスとして起動・監視する
@@ -810,65 +765,80 @@ stateDiagram-v2
 
 ---
 
-## 12. セキュリティ設計
+## 12. 外部プロセスの扱い
 
-### 12.1 攻撃面
+app-server を子プロセスとして動かすため、v2 に無かった考慮点が増える。
+
+| 項目 | 方針 |
+|---|---|
+| 実行ファイルの解決 | PATH 上の `codex` / `claude`。設定でフルパス指定も可 |
+| バージョン確認 | 起動時に `--version` を取り、`/api/v1/providers` で見せる。JSON-RPC の互換性問題の切り分けに使う |
+| 引数 | 固定。ユーザ入力を引数に渡さない |
+| 環境変数 | `CODEX_HOME` のみ明示指定。**それ以外は親の環境を継承しない**（最小の環境で起動する） |
+| stdout | JSON-RPC 専用。パース失敗行は捨ててログに残す |
+| stderr | 行単位でログへ（`debug` レベル） |
+| 標準入力 | 本アプリからの JSON-RPC のみ |
+| 終了処理 | SIGTERM → 5 秒 → SIGKILL。ゾンビを残さない |
+
+---
+
+## 13. セキュリティ設計
+
+### 13.1 攻撃面
 
 | 資産 | 脅威 | 対策 |
 |---|---|---|
-| OAuth トークン | 他プロセスからの読み出し | OS キーチェーン。フォールバック時は §7.1 の限界を明示 |
-| ローカル API | 同一端末の他プロセス／他ユーザからの利用 | `127.0.0.1` バインド + Bearer トークン |
+| Claude 長期トークン | 他プロセスからの読み出し | OS キーチェーン |
+| CLI のクレデンシャル | 本アプリによる破壊 | **読み取り専用**。書き込みもリフレッシュもしない（§6.3） |
+| ローカル API | 同一端末の他プロセスからの利用 | `127.0.0.1` バインド + Bearer トークン |
 | ローカル API | 悪意あるサイトからの CSRF / DNS リバインディング | Origin 検証 + `Host` 検証 + Bearer |
-| 認可フロー | 認可コード横取り | PKCE(S256) + `state` 検証 |
-| ポート 1455 | ログイン中に他プロセスが横取り | bind 失敗時は 409 を返して中断。成功時のみ URL を発行 |
+| 子プロセス | 引数・環境変数経由の注入 | 引数固定、環境変数は最小（§12） |
 
-### 12.2 ローカル API トークン
+### 13.2 ローカル API トークン
 
 - 起動時に 32 バイト乱数を生成し、`<config_dir>/llm-limits/api.token`（0600）に保存
 - Web UI はサーバが開く URL `http://127.0.0.1:7893/?t=<token>` で受け取り、
   `sessionStorage` に格納してから **`history.replaceState` で URL から即座に除去**する
-- `/api/v1/health` と Codex コールバック以外の全エンドポイントで必須
-- ブラウザ外のクライアント（メニューバーアプリ）はトークンファイルを直接読む
+- `/api/v1/health` 以外の全エンドポイントで必須
+- メニューバーアプリはトークンファイルを直接読む
 
-### 12.3 ブラウザ由来リクエストの制限
+### 13.3 ブラウザ由来リクエストの制限
 
-- `Origin` が存在する場合、`http://127.0.0.1:7893` / `http://localhost:7893` 以外は 403
+- `Origin` がある場合、`http://127.0.0.1:7893` / `http://localhost:7893` 以外は 403
 - `Host` ヘッダも同様に検証（DNS リバインディング対策）
-- CORS は許可しない（`Access-Control-Allow-Origin` を返さない）
+- CORS は許可しない
 - 静的資産に CSP: `default-src 'self'; connect-src 'self'`
 
-### 12.4 その他
+### 13.4 その他
 
-- 外向き通信は §6 に挙げたドメインのみ。テレメトリ・クラッシュレポートの送信は行わない
-- アカウント削除時はキーチェーンのエントリと DB の行の両方を削除し、
-  可能であれば Provider 側のトークン失効エンドポイント
-  （Codex: `https://auth.openai.com/oauth/revoke`）も呼ぶ
+- 本アプリからの外向き通信は `api.anthropic.com` のみ
+  （Codex 分は app-server が行うため本アプリからは出ない）
+- テレメトリ・クラッシュレポートの送信は行わない
 
 ---
 
-## 13. 可観測性と運用
+## 14. 可観測性と運用
 
-### 13.1 ログ
+### 14.1 ログ
 
 `log/slog` の JSON ハンドラ。既定 `info`、`--log-level=debug` で詳細化。
-出力先は stderr と `<config_dir>/llm-limits/app.log`（10MB × 3 世代でローテート）。
+出力先は stderr と `<config_dir>/llm-limits/app.log`（10MB × 3 世代）。
 
-主要イベント: 起動／終了、アカウント追加／削除、Fetch 成否とレイテンシ、
-トークンリフレッシュ、バックオフ突入、スキーマ不一致。§7.3 のマスキングを必ず通す。
+主要イベント: 起動／終了、CLI の検出結果とバージョン、アカウント追加／削除、
+取得の成否とレイテンシ、app-server の起動／異常終了、スキーマ不一致。
+§7.4 のマスキングを必ず通す。
 
-### 13.2 デバッグ用エンドポイント
+### 14.2 デバッグ用エンドポイント
 
-`--debug` 起動時のみ有効化する。
+`--debug` 起動時のみ有効。
 
 | Path | 内容 |
 |---|---|
 | `/debug/adapters` | 各 Adapter の直近の生レスポンス（トークンはマスク） |
-| `/debug/schedule` | 各アカウントの次回実行時刻とバックオフ状態 |
+| `/debug/rpc` | app-server との直近 JSON-RPC 往復（同上） |
+| `/debug/schedule` | 次回実行時刻とバックオフ状態 |
 
-非公開エンドポイントに依存する以上、`ErrSchema` の調査が最も頻繁に必要になる。
-そのコストを下げるために用意する。
-
-### 13.3 設定ファイル
+### 14.3 設定ファイル
 
 `<config_dir>/llm-limits/config.toml`
 
@@ -876,9 +846,14 @@ stateDiagram-v2
 port = 7893
 open_browser_on_start = true
 
+[providers]
+codex_bin  = ""          # 空なら PATH から解決
+claude_bin = ""
+codex_homes = ["~/.codex"]   # 複数アカウントはここに追加
+
 [polling]
-interval        = "60s"
-idle_multiplier = 5      # SSE 購読者が 0 のときの倍率
+claude_interval = "60s"
+idle_multiplier = 5
 
 [notify]
 threshold_percent = 90
@@ -889,7 +864,7 @@ Linux `$XDG_CONFIG_HOME`（既定 `~/.config`）、Windows `%APPDATA%`。
 
 ---
 
-## 14. ディレクトリ構成
+## 15. ディレクトリ構成
 
 ```
 llm-limits/
@@ -900,22 +875,26 @@ llm-limits/
 │   │   ├── middleware.go         # Bearer / Origin / Host 検証
 │   │   ├── handlers_accounts.go
 │   │   ├── handlers_quotas.go
-│   │   ├── handlers_login.go     # 8.2 / 8.3 の両方式
-│   │   ├── loopback.go           # ポート1455の一時待受
+│   │   ├── handlers_login.go
 │   │   └── sse.go
 │   ├── core/
 │   │   ├── model.go              # Account / Window / Snapshot / WindowKind
-│   │   ├── classify.go           # classifyByLength (§5.1)
+│   │   ├── classify.go           # classifyByLength (§9.1)
 │   │   ├── scheduler.go
 │   │   └── errors.go
 │   ├── adapter/
 │   │   ├── adapter.go
-│   │   ├── claude/{oauth.go,usage.go,usage_test.go}
-│   │   └── codex/{oauth.go,usage.go,usage_test.go}
-│   ├── store/
-│   │   ├── sqlite.go
-│   │   ├── keychain.go
-│   │   └── migrations/
+│   │   ├── codex/
+│   │   │   ├── appserver.go      # 子プロセス管理 + JSON-RPC
+│   │   │   ├── rpc_types.go      # account/* の型
+│   │   │   ├── normalize.go
+│   │   │   └── normalize_test.go
+│   │   └── claude/
+│   │       ├── creds.go          # setup-token / credentials.json / mtime 監視
+│   │       ├── usage.go
+│   │       └── usage_test.go
+│   ├── procmgr/                  # §12 の子プロセス共通処理
+│   ├── store/{sqlite.go,keychain.go,migrations/}
 │   └── config/config.go
 ├── web/                          # Vite。dist を go:embed
 ├── docs/design.md                # 本書
@@ -924,119 +903,121 @@ llm-limits/
 
 ---
 
-## 15. テスト方針
+## 16. テスト方針
 
 | 層 | 方針 |
 |---|---|
-| Adapter | 実 API から一度採取したレスポンスを testdata に固定し、パースを検証。**ネットワークに出ない** |
-| Adapter | 単位換算の回帰テストを必ず置く（Claude の ×100、Codex の等倍） |
-| classify | 18000秒→5h、604800秒→weekly、境界（±5%）と想定外値 |
-| Scheduler | 時刻を注入可能にし（`clock` インタフェース）、バックオフ・リセット寄せを検証 |
-| Store | 一時ディレクトリの SQLite で実行。キーチェーンはインメモリ実装に差し替え |
+| codex Adapter | app-server を**偽の子プロセス**（テスト用スタブバイナリ）に差し替え、JSON-RPC の往復を検証。実際の `codex` は起動しない |
+| codex Adapter | 異常終了・再起動・通知途絶のシナリオをスタブから駆動 |
+| claude Adapter | 実 API から一度採取したレスポンスを testdata に固定。**ネットワークに出ない** |
+| 両 Adapter | **単位換算の回帰テスト**（Claude の ×100、Codex の等倍）を必ず置く |
+| classify | 300分→5h、10080分→weekly、境界（±5%）と想定外値 |
+| Scheduler | `clock` を注入し、バックオフ・リセット寄せを検証 |
+| Store | 一時ディレクトリの SQLite。キーチェーンはインメモリ実装に差し替え |
 | API | `httptest` でミドルウェア（Bearer 欠落 403、不正 Origin 403）を検証 |
-| E2E | OAuth と Provider API をモックしたスタブサーバで、ログイン〜表示まで通す |
+| E2E | app-server スタブ + Claude API スタブで、追加〜表示まで通す |
 
-**単位換算のテストを明示的に挙げているのは、
-`utilization`(0–1) と `used_percent`(0–100) の取り違えが
-「100倍ずれた値を自信を持って表示する」形の障害になるため。**
-
-パースは未知フィールドを無視しつつ、`five_hour` / `weekly` に対応する枠の欠落は
-`ErrSchema` として明示的にエラーにする。
+**単位換算のテストを明示しているのは、`utilization`(0–1) と `usedPercent`(0–100) の
+取り違えが「100倍ずれた値を自信を持って表示する」形の障害になるため。**
 
 ---
 
-## 16. 実装フェーズ
+## 17. 実装フェーズ
 
 | Phase | 内容 | 完了条件 |
 |---|---|---|
 | P0 | スケルトン: 設定、SQLite、HTTP、Bearer ミドルウェア | `/api/v1/health` が 200 |
-| P1a | Codex Adapter（OAuth、§8.2） | ログインしトークンがキーチェーンに入る |
-| P1b | Codex Adapter（Fetch）+ Scheduler + `/quotas` | `codex` CLI の `/status` と値が一致する |
+| P1a | procmgr + app-server の JSON-RPC 疎通（`initialize` / `account/read`） | スタブと実 `codex` の両方で疎通 |
+| P1b | `account/rateLimits/read` + `updated` 購読 + 正規化 | `codex` の TUI 表示と値が一致する |
 | P1c | Web UI ダッシュボード + SSE | 5h/週間の消費率とリセット時刻がリアルタイム更新される |
-| P2a | Claude Adapter（OAuth、§8.3 の貼り付け方式） | 同上 |
-| P2b | Claude Adapter（Fetch） | `claude` CLI の `/usage` と値が一致する |
-| P3 | 設定画面、history/スパークライン、リリースワークフロー | 3 OS のバイナリが CI から出る |
+| P1d | `account/login/start` によるログイン導線（§8.1） | Web 画面から Codex アカウントを追加できる |
+| P2a | Claude: setup-token 経路 + `/api/oauth/usage` | `claude` の `/usage` と値が一致する |
+| P2b | Claude: credentials.json 経路 + mtime 監視 | CLI 側のリフレッシュに追随する |
+| P3 | 設定画面、複数 CODEX_HOME、history、リリースワークフロー | 3 OS のバイナリが CI から出る |
 | P4 | Tauri メニューバークライアント | 本設計の対象外（別途設計） |
 
-**v1 から Claude と Codex の順序を入れ替えた。** Codex はソースが公開されており
-仕様の確度が最も高く、ループバック方式でフローも単純なため、
-コア（Scheduler・正規化・SSE・UI）の検証台として先に通すのが速い。
-Claude の貼り付け方式は UI に追加の作り込みが要るので後段に置く。
+Codex を先行させるのは、**公開インタフェースで仕様の確度が最も高く、
+push があるためコア（正規化・SSE・UI）の検証台として速い**ため。
 
 完了条件を「公式クライアントの表示と一致」に置いているのは、
-非公開エンドポイントを使う以上、正しさの基準がそこにしかないため。
+正しさの基準がそこにしかないため。
 
 ---
 
-## 17. リスクと未決事項
+## 18. リスクと未決事項
 
 | # | 項目 | 影響 | 対応方針 |
 |---|---|---|---|
-| R1 | 残量取得エンドポイントが非公開で、予告なく変わる | 機能停止 | `ErrSchema` 検出 + `/debug/adapters`（§13.2）。Adapter を薄く保つ。Codex は §6.3 のフォールバック経路が控えとして存在する |
-| R2 | ポート 1455 が Codex CLI と競合する | ログイン失敗 | ログイン中のみ bind。失敗時は 409 と明確なメッセージ（§8.2） |
-| R3 | Claude の貼り付け方式が UX 上の摩擦になる | 導入時の離脱 | 手順を 1 画面に集約。将来ループバックが許可されたら §8.2 方式へ寄せる |
-| R4 | OAuth の client_id / scope が変わる | ログイン不能 | 定数を 1 ファイルに集約し、設定で上書き可能にする |
-| R5 | 各サービスの利用規約 | 配布時の問題 | 自アカウントの状態取得に限定。リクエスト量を公式クライアント以下に抑える |
-| R6 | キーチェーン非対応環境での保護が弱い | 情報漏洩 | §7.1 の限界を UI・ログで明示 |
-| R7 | Claude の `utilization` と Codex の `used_percent` のスケール差 | 100倍ずれた値の表示 | 換算を Adapter 内に閉じ、§15 の回帰テストで固定 |
+| R1 | **公式 CLI のインストールが前提**になった | 導入の敷居が上がる | `/api/v1/providers` で検出状況と導入手順を明示。これは §2 の判断の代償として受け入れる |
+| R2 | app-server の JSON-RPC が将来変わる | 機能停止 | 起動時にバージョンを記録。`ErrSchema` 検出と `/debug/rpc`（§14.2） |
+| R3 | Claude の `/api/oauth/usage` は非公開 | 機能停止 | `ErrSchema` 検出。Codex と違いここだけは公開 IF が無い |
+| R4 | Claude の credentials.json 読み取りが CLI と競合 | CLI 側のログイン破壊 | **読み取り専用に徹する**（§6.3）。既定は setup-token 経路 |
+| R5 | app-server の複数アカウント API が未接続 | 複数アカウントが煩雑 | `CODEX_HOME` を分ける方式で回避。将来 API が通れば単一プロセス化する |
+| R6 | 単位スケールの取り違え | 100倍ずれた値の表示 | 換算を Adapter 内に閉じ、§16 の回帰テストで固定 |
+| R7 | 子プロセスのリーク・ゾンビ | 常駐アプリとして致命的 | §12 の終了処理。E2E で異常終了シナリオを回す |
 
-### 実装着手前に確定させるべきこと
+### 実装着手前に確認すべきこと
 
-v1 で挙げた 3 点はすべて解消した（§18 に根拠を記載）。残る確認事項は次の 2 点で、
-いずれも**実アカウントでの初回疎通時にしか確認できない**類のもの。
+1. **macOS で `claude` が Keychain に置くクレデンシャルのサービス名**（未確認）。
+   確認できるまで macOS では setup-token 経路のみを提示する（§6.3）。
+2. `claude setup-token` の長期トークンで `/api/oauth/usage` が通るか（未検証）。
+   通らなければ Claude は credentials.json 経路が既定になる。
+3. `codex app-server` の `initialize` パラメータの必須項目。
+   → 公式 SDK（`sdk/python`）の生成コードに型があるため、実装時に参照できる。
 
-1. `GET /api/oauth/usage` のレスポンスに含まれる枠キーの実際の顔ぶれ
-   （プランによって `seven_day_opus` の有無などが変わる想定）。
-   → 未知キーは `other` として取り込む設計なので、**実装をブロックしない**。
-2. Claude の認可コード貼り付けフローで、コードに `state` が
-   どの形式で同梱されるか（`code#state` 形式を想定）。
-   → §8.3 のパースを寛容にすることで吸収する。
+いずれも**設計の骨格には影響しない**（Adapter 内に閉じている）。
 
 ---
 
-## 18. 根拠となる出典
+## 19. 根拠となる出典
 
-本設計の Provider 固有の記述は、以下の実物から確認した。
-**推測で書いた箇所はない。**変更に気づけるよう、確認元を残しておく。
+本設計の Provider 固有の記述は、以下の実物から確認した。**推測で書いた箇所はない。**
 
 ### A. Claude
 
 出典: Claude Code CLI 実行バイナリ（`/opt/claude-code/bin/claude`、2026-08 時点）内の文字列。
-Claude Code のソースは非公開のため、配布物からの確認となる。
+ソースは非公開のため配布物からの確認となる。
 
-| 事実 | 確認内容 |
+| # | 事実 |
 |---|---|
-| 使用量エンドポイント | `/api/oauth/usage`、および `?at_wall=1&skip_spend=1` 付きの軽量版 |
-| リクエスト | `GET`、`timeout: 5000`、`Content-Type: application/json`、401 で OAuth リフレッシュ後に 1 回再試行 |
-| beta ヘッダ | `oauth-2025-04-20` |
-| レスポンス構造 | `five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` / `seven_day_oauth_apps` / `overage` の各キーに `{utilization, resets_at}` |
-| 単位 | `used_percentage: utilization * 100` の換算が存在 → `utilization` は 0–1 |
-| リセット時刻 | `resets_at * 1000 > Date.now()` の比較が存在 → エポック**秒** |
-| OAuth 定数 | `CLIENT_ID: 9d1c250a-e61b-44d9-88ed-5944d1962f5e`, `CLAUDE_AI_AUTHORIZE_URL: https://claude.com/cai/oauth/authorize`, `TOKEN_URL: https://platform.claude.com/v1/oauth/token`, `MANUAL_REDIRECT_URL: https://platform.claude.com/oauth/code/callback` |
-| ループバックの不在 | バイナリ内の `http://localhost:PORT` はすべて開発用ベース URL（3000/4000/8000）で、OAuth コールバック用のループバックは存在しない |
+| A1 | 使用量エンドポイント `/api/oauth/usage`、および `?at_wall=1&skip_spend=1` 付きの軽量版 |
+| A2 | `GET`、`timeout: 5000`、`Content-Type: application/json` |
+| A3 | beta ヘッダ `oauth-2025-04-20` |
+| A4 | レスポンス構造 `five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` / `seven_day_oauth_apps` / `overage` の各キーに `{utilization, resets_at}` |
+| A5 | `used_percentage: utilization * 100` の換算が存在 → `utilization` は 0–1 |
+| A6 | `resets_at * 1000 > Date.now()` の比較が存在 → エポック**秒** |
+| A7 | `.credentials.json` の **mtime を監視**して更新を検知する実装が存在 |
+| A8 | クレデンシャルのパスは `$CLAUDE_CONFIG_DIR ?? ~/.claude` 配下の `.credentials.json` |
+| A9 | 環境変数 `CLAUDE_CODE_OAUTH_TOKEN` を参照する分岐が存在 |
+| A10 | CLI サブコマンドに `setup-token`（「長期認証トークンの設定。Claude サブスクリプションが必要」）が存在。**`usage` サブコマンドは存在しない** |
 
-### B. Codex
+### B. Codex（公開インタフェース＝本設計が依存する部分）
 
-出典: [`openai/codex`](https://github.com/openai/codex)（Apache-2.0）、commit `6478a75`。
+出典: [`openai/codex`](https://github.com/openai/codex)（Apache-2.0）commit `6478a75`。
+
+| # | 事実 | ファイル |
+|---|---|---|
+| C1 | `account/rateLimits/read` の定義（`#[experimental]` 指定なし＝安定 API） | `codex-rs/app-server-protocol/src/protocol/common.rs:1229` |
+| C2 | `account/rateLimits/updated` 通知 | 同 `:1902`、`codex-rs/app-server/src/outgoing_message.rs:855` |
+| C3 | `GetAccountRateLimitsResponse { rateLimits, rateLimitsByLimitId, rateLimitResetCredits }` | `.../protocol/v2/account.rs:310-319` |
+| C4 | `RateLimitWindow { usedPercent: i32, windowDurationMins, resetsAt }`（camelCase） | 同 `:645-651` |
+| C5 | `account/login/start` が `{ loginId, authUrl }` を返す（`type: "chatgpt"`） | `common.rs:1196`、`v2/account.rs:136-149` |
+| C6 | `account/login/cancel` / `account/read` / `account/logout` | `common.rs:1217,1223,1363` |
+| C7 | 上記が公式 SDK に生成済みの型として含まれる | `sdk/python/src/openai_codex/generated/v2_all.py:6403`、`notification_registry.py:80` |
+| C8 | **枠の長さからラベルを導出**（5h / daily / weekly / monthly / annual、±5%） | `codex-rs/tui/src/chatwidget/rate_limits.rs:77-106` |
+| C9 | 複数アカウント API は型のみで未接続（`AccountSessionsAddParams`） | `v2/account.rs:194` |
+| C10 | **first-party originator の判定**（`codex_cli_rs` / `codex-tui` / `codex_vscode` / `Codex *`） | `codex-rs/login/src/auth/default_client.rs:153-158` — §2.2 の根拠 |
+
+### C. Codex（採用しなかった経路の記録）
+
+以下は §2 の判断により**使わない**が、なぜ使わないかの判断材料として記録する。
 
 | 事実 | ファイル |
 |---|---|
-| 使用量エンドポイント `{base}/wham/usage`（ChatGPT 系）/ `{base}/api/codex/usage` | `codex-rs/backend-client/src/client/rate_limit_resets.rs:81-84` |
-| `GET` かつ読み取り専用（`get_rate_limit_status`） | 同 `:31-35` |
-| ベース URL `https://chatgpt.com/backend-api` の自動補完 | `codex-rs/backend-client/src/client.rs:181-193` |
-| リクエストヘッダ（Bearer + `ChatGPT-Account-Id` + `X-OpenAI-Fedramp`） | 同 `:242-262` |
-| レスポンス構造 `plan_type` / `rate_limit` / `credits` / `additional_rate_limits` | `codex-rs/codex-backend-openapi-models/src/models/rate_limit_status_payload.rs` |
-| `primary_window` / `secondary_window` | `.../rate_limit_status_details.rs` |
-| 窓の中身 `used_percent`(整数) / `limit_window_seconds` / `reset_after_seconds` / `reset_at` | `.../rate_limit_window_snapshot.rs` |
-| ヘッダ経由の同等値 `x-codex-{primary,secondary}-{used-percent,window-minutes,reset-at}` | `codex-rs/codex-api/src/rate_limits.rs:60-95` |
-| SSE イベント `codex.rate_limits` | 同 `:107-160` |
-| **枠の長さからラベルを導出**（5h / daily / weekly / monthly / annual、±5%） | `codex-rs/tui/src/chatwidget/rate_limits.rs:77-106` |
-| OAuth: issuer / port / scope / PKCE / 追加クエリ | `codex-rs/login/src/server.rs:59-60,176,575-611` |
-| OAuth: `CLIENT_ID: app_EMoamEEZ73f0CkXaXp7hrann`、token/revoke URL | `codex-rs/login/src/auth/manager.rs:197-201,1708` |
-| リフレッシュ要求の形 `{client_id, grant_type, refresh_token}` | 同 `:1694-1705` |
-| `id_token` クレーム名前空間 `https://api.openai.com/auth` | `codex-rs/login/src/token_data.rs:29-42,71-99` |
+| 直接叩ける使用量エンドポイント `{base}/wham/usage` | `codex-rs/backend-client/src/client/rate_limit_resets.rs:81-84` |
+| そのリクエストヘッダ（Bearer + `ChatGPT-Account-Id`） | `codex-rs/backend-client/src/client.rs:242-262` |
+| OAuth 定数（client_id / issuer / ポート 1455 / scope） | `codex-rs/login/src/server.rs:59-60,176,575-611`、`auth/manager.rs:197-201,1708` |
 
-**C4 の含意**: Codex CLI 自身が「primary = 5時間」と決め打ちせず
-窓の長さからラベルを導出している。本設計が §5.1 で
-`classifyByLength` を採る根拠がこれで、`primary`/`secondary` という
-位置に意味を持たせるべきではない。
+**C8 の含意**: Codex CLI 自身が「primary = 5時間」と決め打ちせず窓の長さから
+ラベルを導出している。本設計が §9.1 で `classifyByLength` を採る根拠がこれで、
+`primary`/`secondary` という位置に意味を持たせるべきではない。
